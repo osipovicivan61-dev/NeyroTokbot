@@ -34,11 +34,15 @@ from aiogram.enums import ChatType, ParseMode
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramRetryAfter
 from aiogram.types import (
     BotCommand,
+    BotCommandScopeAllGroupChats,
+    BotCommandScopeAllPrivateChats,
+    BotCommandScopeDefault,
     CallbackQuery,
     FSInputFile,
     InlineKeyboardButton,
     ForceReply,
     InlineKeyboardMarkup,
+    MenuButtonCommands,
     Message,
     ReplyParameters,
 )
@@ -958,14 +962,29 @@ async def on_startup():
     await engine.start()
     for i in range(MAX_PARALLEL):
         asyncio.create_task(worker(i))
-    cmds = [
-        BotCommand(command="sd2fast", description="Видео SD 2 Fast — быстрее"),
-        BotCommand(command="sd2", description="Видео SD 2 — больше деталей"),
-        BotCommand(command="queue", description="Очередь"),
-        BotCommand(command="cancel", description="Закрыть черновик"),
-        BotCommand(command="help", description="Как пользоваться"),
+    await setup_menu()
+
+
+async def setup_menu():
+    """Кнопка «Меню» слева от поля ввода = список команд (сбрасывает кнопку Mini App из BotFather)."""
+    private_cmds = [
+        BotCommand(command="sd2fast", description="🎬 Видео SD 2 Fast — быстрее"),
+        BotCommand(command="sd2", description="🎬 Видео SD 2 — больше деталей"),
+        BotCommand(command="queue", description="📊 Очередь генераций"),
+        BotCommand(command="cancel", description="✖️ Закрыть черновик"),
+        BotCommand(command="help", description="❓ Как пользоваться"),
+        BotCommand(command="start", description="🏠 Начало"),
     ]
-    await safe(bot.set_my_commands(cmds))
+    group_cmds = private_cmds[:4]
+    for scope, cmds in (
+        (BotCommandScopeDefault(), private_cmds),
+        (BotCommandScopeAllPrivateChats(), private_cmds),
+        (BotCommandScopeAllGroupChats(), group_cmds),
+    ):
+        for lang in (None, "ru"):
+            await safe(bot.delete_my_commands(scope=scope, language_code=lang))
+            await safe(bot.set_my_commands(cmds, scope=scope, language_code=lang))
+    await safe(bot.set_chat_menu_button(menu_button=MenuButtonCommands()))
 
 
 async def on_shutdown():
