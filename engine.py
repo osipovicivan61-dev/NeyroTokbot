@@ -261,7 +261,12 @@ class DirectEngine(BaseEngine):
             if cancel.is_set():
                 raise Cancelled()
             if time.monotonic() > deadline:
-                raise GenerationError(f"сайт не отвечает 5 минут ({reason}). Попробуйте позже")
+                if reason.startswith("HTTP 5"):
+                    raise GenerationError(
+                        f"сайт генерации сейчас не работает ({reason}): ошибка на стороне сайта, а не бота. "
+                        "Нажмите «🔁 Повторить» через 5–10 минут, промпт и референсы сохранятся"
+                    )
+                raise GenerationError(f"сайт генерации не отвечает 5 минут ({reason}). Нажмите «🔁 Повторить» чуть позже")
             await on_status("wake", f"попытка {attempt}")
             await asyncio.sleep(10)
 
