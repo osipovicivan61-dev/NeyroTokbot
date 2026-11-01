@@ -106,6 +106,7 @@ class Draft:
     owner_id: int  # 0 = канал (жать кнопки могут админы канала)
     owner_name: str
     model: str
+    thread_id: int | None = None  # тема (topic) в группе с темами; None = обычный чат / «Общее»
     prompt: str = ""
     duration: int = DEFAULT_DURATION
     ratio: str = DEFAULT_RATIO
@@ -138,7 +139,7 @@ class Job:
     last_push: float = 0.0
 
 
-drafts: dict[tuple[int, int], Draft] = {}
+drafts: dict[tuple[int, int | None, int], Draft] = {}
 drafts_by_id: dict[str, Draft] = {}
 jobs: dict[str, Job] = {}  # активные + недавние (для «Повторить»)
 pending: list[Job] = []
@@ -153,6 +154,15 @@ def owner_of(m: Message) -> tuple[int, str]:
         return 0, m.chat.title or "канал"
     u = m.from_user
     return u.id, u.full_name
+
+
+def thread_of(m: Message) -> int | None:
+    """id темы, если сообщение написано в теме группы-форума (или в теме лички с ботом)."""
+    return m.message_thread_id if m.is_topic_message else None
+
+
+def draft_key(d: Draft) -> tuple[int, int | None, int]:
+    return (d.chat_id, d.thread_id, d.owner_id)
 
 
 def is_private(chat_type: str) -> bool:
@@ -341,12 +351,12 @@ async def show_panel(d: Draft, *, resend: bool = False):
             return
     if d.panel_id:
         await safe(bot.delete_message(d.chat_id, d.panel_id))
-    msg = await bot.send_message(d.chat_id, text, reply_markup=kb)
+    msg = await bot.send_message(d.chat_id, text, reply_markup=kb, message_thread_id=d.thread_id)
     d.panel_id = msg.message_id
 
 
 def drop_draft(d: Draft):
-    drafts.pop((d.chat_id, d.owner_id), None)
+    drafts.pop(draft_key(d), None)
     drafts_by_id.pop(d.id, None)
 
 
@@ -391,7 +401,7 @@ async def handle_batch(msgs: list[Message]):
     raw = (text_msg.text or text_msg.caption) if text_msg else ""
     cmd, rest = parse_command(raw)
     uid, uname = owner_of(first)
-    key = (chat.id, uid)
+    key = (chat.id, thread_of(first), uid)
 
     if cmd in ("start", "help"):
         await first.answer(HELP)
@@ -424,6 +434,7 @@ async def handle_batch(msgs: list[Message]):
             owner_id=uid,
             owner_name=uname,
             model="fast" if cmd == "sd2fast" else "sd2",
+            thread_id=thread_of(first),
             prompt=prompt,
             duration=dur or DEFAULT_DURATION,
             ratio=ratio or DEFAULT_RATIO,
@@ -549,7 +560,7 @@ async def ask_prompt(d: Draft):
     markup = None if d.chat_type == ChatType.CHANNEL else ForceReply(
         input_field_placeholder="Например: кот в скафандре идёт по Луне, кинематографично"
     )
-    msg = await safe(bot.send_message(d.chat_id, text, reply_markup=markup))
+    msg = await safe(bot.send_message(d.chat_id, text, reply_markup=markup, message_thread_id=d.thread_id))
     if msg:
         d.ask_id = msg.message_id
         d.service_msgs.append(msg.message_id)
@@ -759,7 +770,7 @@ async def on_job_button(cb: CallbackQuery):
         jobs.pop(jid, None)
         d.id = uuid.uuid4().hex[:10]
         d.panel_id = job.status_msg_id
-        drafts[(d.chat_id, d.owner_id)] = d
+        drafts[draft_key(d)] = d
         drafts_by_id[d.id] = d
         await cb.answer()
         await show_panel(d)
@@ -908,17 +919,19 @@ async def deliver(job: Job, url: str, tmp: Path):
     if 0 < size <= TG_UPLOAD_LIMIT:
         sent = await tg(
             lambda: bot.send_video(
-                d.chat_id, FSInputFile(path, filename="video.mp4"), caption=caption,
+                d.chat_id, FSInputFile(path, filename="video.mp4"), caption=caption, message_thread_id=d.thread_id,
                 supports_streaming=True, reply_parameters=reply, reply_markup=link_kb,
                 request_timeout=300,
             )
         )
     if not sent:  # большой файл или не скачался — пробуем отдать ссылкой
-        sent = await tg(lambda: bot.send_video(d.chat_id, url, caption=caption, reply_parameters=reply, reply_markup=link_kb), tries=2)
+        sent = await tg(lambda: bot.send_video(
+            d.chat_id, url, caption=caption, reply_parameters=reply, reply_markup=link_kb, message_thread_id=d.thread_id,
+        ), tries=2)
     if not sent:
         await tg(lambda: bot.send_message(
             d.chat_id, caption + "\n\nВидео готово, но не влезло в Telegram (больше 50 МБ). Скачайте по кнопке:",
-            reply_markup=link_kb, reply_parameters=reply,
+            reply_markup=link_kb, reply_parameters=reply, message_thread_id=d.thread_id,
         ))
 
     if d.chat_type == ChatType.CHANNEL and CHANNEL_CLEANUP:
