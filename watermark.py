@@ -120,8 +120,18 @@ def _masks(L: Layout) -> tuple[Image.Image, Image.Image, Image.Image, tuple[int,
         [ox, oy, ox + L.w - 1, oy + L.h - 1], radius=round(min(L.h * 0.30, L.s * 0.035)), fill=255
     )
     cx = ox + L.w / 2
+    # строки прижаты к тому краю экрана, у которого стоит знак
+    align = {"br": "right", "tr": "right", "bl": "left", "tl": "left"}.get(POSITION, "center")
+
+    def at(width: float) -> float:
+        if align == "right":
+            return ox + L.w - L.pad_x - width
+        if align == "left":
+            return ox + L.pad_x
+        return cx - width / 2
+
     y = oy + L.pad_y
-    x1 = cx - L.line1_w / 2
+    x1 = at(L.line1_w)
     td = ImageDraw.Draw(title)
     _draw_spaced(td, x1 + L.star_r * 2 + L.star_gap, y - L.t_top, L.title, L.f_title, L.t_track, 255)
     star_c = (x1 + L.star_r, y + L.t_h * 0.48)
@@ -130,10 +140,10 @@ def _masks(L: Layout) -> tuple[Image.Image, Image.Image, Image.Image, tuple[int,
     y += L.t_h + L.gap1
     sd = ImageDraw.Draw(small)
     mini = STYLE == "minimal"
-    _draw_spaced(sd, cx - L.s_w / 2, y - L.s_top, L.small, L.f_small, L.s_track, 165 if mini else 190)
+    _draw_spaced(sd, at(L.s_w), y - L.s_top, L.small, L.f_small, L.s_track, 165 if mini else 190)
     if L.user:
         y += L.s_h + L.gap2
-        sd.text((cx - L.u_w / 2, y - L.u_top), L.user, font=L.f_user, fill=205 if mini else 235)
+        sd.text((at(L.u_w), y - L.u_top), L.user, font=L.f_user, fill=205 if mini else 235)
     return title, small, pill, star_box
 
 
