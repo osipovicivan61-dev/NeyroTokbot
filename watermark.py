@@ -28,7 +28,8 @@ from PIL import Image, ImageDraw, ImageFilter, ImageFont
 log = logging.getLogger("watermark")
 
 FONTS = Path(__file__).with_name("fonts")
-TITLE_FONT = FONTS / "Unbounded-800.ttf"
+STYLE = os.getenv("WATERMARK_STYLE", "minimal")  # minimal | bold
+TITLE_FONT = FONTS / ("Unbounded-500.ttf" if STYLE == "minimal" else "Unbounded-800.ttf")
 SMALL_FONT = FONTS / "Montserrat-600.ttf"
 USER_FONT = FONTS / "Montserrat-500.ttf"
 
@@ -75,11 +76,12 @@ class Layout:
     def __init__(self, short_side: int, user: str):
         s = short_side
         self.s = s
-        self.f_title = _font(TITLE_FONT, max(18, round(s * 0.060)))
-        self.f_small = _font(SMALL_FONT, max(9, round(s * 0.019)))
-        self.f_user = _font(USER_FONT, max(10, round(s * 0.023)))
+        mini = STYLE == "minimal"
+        self.f_title = _font(TITLE_FONT, max(16, round(s * (0.048 if mini else 0.060))))
+        self.f_small = _font(SMALL_FONT, max(8, round(s * (0.016 if mini else 0.019))))
+        self.f_user = _font(USER_FONT, max(9, round(s * (0.020 if mini else 0.023))))
         self.title, self.small, self.user = "NeyroTok", "PRIVATE", user
-        self.t_track = self.f_title.size * 0.01
+        self.t_track = self.f_title.size * (0.06 if mini else 0.01)
         self.s_track = self.f_small.size * 0.55
         self.star_r = self.f_title.size * 0.36 if STAR else 0.0
         self.star_gap = self.f_title.size * 0.30 if STAR else 0.0
@@ -97,8 +99,8 @@ class Layout:
         self.line1_w = self.star_r * 2 + self.star_gap + self.t_w
         self.pad_x = round(s * 0.028)
         self.pad_y = round(s * 0.020)
-        self.gap1 = round(s * 0.014)
-        self.gap2 = round(s * 0.008)
+        self.gap1 = round(s * (0.011 if mini else 0.014))
+        self.gap2 = round(s * (0.006 if mini else 0.008))
         inner_w = max(self.line1_w, self.s_w, self.u_w)
         inner_h = self.t_h + self.gap1 + self.s_h + ((self.gap2 + self.u_h) if user else 0)
         self.w = int(inner_w + self.pad_x * 2)
@@ -127,10 +129,11 @@ def _masks(L: Layout) -> tuple[Image.Image, Image.Image, Image.Image, tuple[int,
                 int(star_c[0] + L.star_r * 1.4), int(star_c[1] + L.star_r * 1.4))
     y += L.t_h + L.gap1
     sd = ImageDraw.Draw(small)
-    _draw_spaced(sd, cx - L.s_w / 2, y - L.s_top, L.small, L.f_small, L.s_track, 190)
+    mini = STYLE == "minimal"
+    _draw_spaced(sd, cx - L.s_w / 2, y - L.s_top, L.small, L.f_small, L.s_track, 165 if mini else 190)
     if L.user:
         y += L.s_h + L.gap2
-        sd.text((cx - L.u_w / 2, y - L.u_top), L.user, font=L.f_user, fill=235)
+        sd.text((cx - L.u_w / 2, y - L.u_top), L.user, font=L.f_user, fill=205 if mini else 235)
     return title, small, pill, star_box
 
 
@@ -151,7 +154,11 @@ def render_loop(out_dir: Path, w: int, h: int, user: str) -> tuple[Layout, int]:
     """Рисует бесшовный цикл кадров знака. Возвращает (геометрию, число кадров)."""
     L = Layout(min(w, h), user)
     title, small, pill, star_box = _masks(L)
-    metal = _metal(L.cw, L.ch, L.margin + L.pad_y, L.margin + L.pad_y + L.t_h)
+    mini = STYLE == "minimal"
+    if mini:  # ровный светло-серый, без металлических полос
+        metal = Image.new("L", (L.cw, L.ch), 200)
+    else:
+        metal = _metal(L.cw, L.ch, L.margin + L.pad_y, L.margin + L.pad_y + L.t_h)
 
     # тень под текстом
     text_all = Image.new("L", (L.cw, L.ch), 0)
@@ -159,8 +166,12 @@ def render_loop(out_dir: Path, w: int, h: int, user: str) -> tuple[Layout, int]:
     text_all.paste(small, (0, 0), small)
     # без подложки тень плотнее, чтобы светлый текст читался и на светлом фоне
     sh_k = 0.55 if PILL_OPACITY > 0 else 1.0
-    blurred = text_all.filter(ImageFilter.GaussianBlur(L.shadow))
-    shadow_a = blurred.point(lambda v: min(255, int(v * 1.6 * sh_k * OPACITY)))
+    if mini:  # мягкая широкая тень, почти незаметная, только для читаемости
+        blurred = text_all.filter(ImageFilter.GaussianBlur(L.shadow * 1.8))
+        shadow_a = blurred.point(lambda v: min(255, int(v * 1.1 * sh_k * OPACITY)))
+    else:
+        blurred = text_all.filter(ImageFilter.GaussianBlur(L.shadow))
+        shadow_a = blurred.point(lambda v: min(255, int(v * 1.6 * sh_k * OPACITY)))
     black = Image.new("L", (L.cw, L.ch), 0)
     base = Image.new("RGBA", (L.cw, L.ch), (0, 0, 0, 0))
     if PILL_OPACITY > 0:
@@ -180,7 +191,7 @@ def render_loop(out_dir: Path, w: int, h: int, user: str) -> tuple[Layout, int]:
     base.alpha_composite(small_rgba)
 
     n = max(2, round(LOOP_SEC * LOOP_FPS))
-    band = L.w * 0.16
+    band = L.w * (0.30 if mini else 0.16)  # в минимализме переход шире и мягче
     title_a = title.point(lambda v: int(v * OPACITY))
     sx0, sy0, sx1, sy1 = star_box
     scx, scy = (sx0 + sx1) / 2, (sy0 + sy1) / 2
@@ -193,6 +204,8 @@ def render_loop(out_dir: Path, w: int, h: int, user: str) -> tuple[Layout, int]:
         for x in xs:
             dx = (x - pos)
             k = math.exp(-(dx / band) ** 2 * 1.6) if ph < 0.65 else 0.0
+            if mini:
+                k *= 0.85
             row.append(int(255 * k))
         shine = Image.new("L", (L.cw, 1))
         shine.putdata(row)
