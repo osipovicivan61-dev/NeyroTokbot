@@ -33,7 +33,7 @@ SMALL_FONT = FONTS / "Montserrat-600.ttf"
 USER_FONT = FONTS / "Montserrat-500.ttf"
 
 OPACITY = float(os.getenv("WATERMARK_OPACITY", "0.88"))  # видимость текста
-PILL_OPACITY = float(os.getenv("WATERMARK_BG", "0.32"))  # тёмная подложка, 0 = без неё
+PILL_OPACITY = float(os.getenv("WATERMARK_BG", "0"))  # тёмная подложка: 0 = без неё, например 0.32 — с ней
 POSITION = os.getenv("WATERMARK_POS", "br")  # br | bl | tr | tl | bc
 PRESET = os.getenv("WATERMARK_PRESET", "ultrafast")  # скорость кодирования x264
 LOOP_SEC = 2.4  # длина цикла блика
@@ -156,7 +156,10 @@ def render_loop(out_dir: Path, w: int, h: int, user: str) -> tuple[Layout, int]:
     text_all = Image.new("L", (L.cw, L.ch), 0)
     text_all.paste(title, (0, 0), title)
     text_all.paste(small, (0, 0), small)
-    shadow_a = text_all.filter(ImageFilter.GaussianBlur(L.shadow)).point(lambda v: int(v * 0.55 * OPACITY))
+    # без подложки тень плотнее, чтобы светлый текст читался и на светлом фоне
+    sh_k = 0.55 if PILL_OPACITY > 0 else 1.0
+    blurred = text_all.filter(ImageFilter.GaussianBlur(L.shadow))
+    shadow_a = blurred.point(lambda v: min(255, int(v * 1.6 * sh_k * OPACITY)))
     black = Image.new("L", (L.cw, L.ch), 0)
     base = Image.new("RGBA", (L.cw, L.ch), (0, 0, 0, 0))
     if PILL_OPACITY > 0:
