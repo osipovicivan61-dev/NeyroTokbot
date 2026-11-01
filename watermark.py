@@ -2,7 +2,7 @@
 Анимированный водяной знак NeyroTok для готовых видео.
 
   NeyroTok        ← Unbounded, серо-белый градиент с бегущим бликом
- ── PRIVATE ──    ← мелко, разрядка
+    PRIVATE       ← мелко, разрядка
    @username      ← кто генерировал
 
 Знак полупрозрачный, плавно появляется в начале ролика (проявление + подъём)
@@ -69,10 +69,8 @@ def build_mask(short_side: int, user: str) -> Image.Image:
 
     tw = _spaced_width(f_title, title, t_track)
     sw = _spaced_width(f_small, small, s_track)
-    line = f_small.size * 1.6
-    gap = f_small.size * 0.7
     uw = _spaced_width(f_user, user, 0) if user else 0
-    w = int(max(tw, sw + 2 * (line + gap), uw)) + 8
+    w = int(max(tw, sw, uw)) + 8
     t_box = f_title.getbbox(title)
     s_box = f_small.getbbox(small)
     u_box = f_user.getbbox(user or "A")
@@ -88,10 +86,6 @@ def build_mask(short_side: int, user: str) -> Image.Image:
     y = th + pad * 1.3
     sx = (w - sw) / 2
     _spaced(d, (sx, y - s_box[1]), small, f_small, s_track)
-    ly = y + sh / 2
-    lw = max(1, round(s * 0.0018))
-    d.line([(sx - gap - line, ly), (sx - gap, ly)], fill=200, width=lw)
-    d.line([(sx + sw + gap, ly), (sx + sw + gap + line, ly)], fill=200, width=lw)
     if user:
         y += sh + pad
         d.text(((w - uw) / 2, y - u_box[1]), user, font=f_user, fill=235)
