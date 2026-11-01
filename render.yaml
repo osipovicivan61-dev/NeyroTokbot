@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: neyrotokbot
+    runtime: docker
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: BOT_TOKEN
+        sync: false        # впишите в дашборде Render
+      - key: ADMIN_IDS
+        sync: false        # ваш Telegram ID (без лимитов)
+      - key: ENGINE
+        value: browser     # browser = через сайт в браузере, direct = лёгкий режим
+      - key: MAX_PARALLEL
+        value: "1"
+      - key: DAILY_LIMIT
+        value: "5"
+      - key: SITE_URL
+        value: https://okroshka-su6j.onrender.com/
