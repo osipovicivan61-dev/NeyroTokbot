@@ -6,10 +6,12 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 COPY requirements.txt .
-RUN pip install -r requirements.txt \
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ffmpeg fonts-dejavu-core \
+ && pip install -r requirements.txt \
  && playwright install --with-deps --only-shell chromium \
  && rm -rf /var/lib/apt/lists/*
 
-COPY bot.py engine.py ./
+COPY bot.py engine.py grid.py ./
 
 CMD ["python", "bot.py"]

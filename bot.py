@@ -49,6 +49,7 @@ from aiogram.types import (
 from aiohttp import web
 
 from engine import REF_LIMITS, Cancelled, GenerationError, make_engine
+from grid import COLORS, SIZES, STYLES, GridCfg, GridStopped, apply_photo, apply_video, parse_hex, preview_video, probe
 
 # ----------------------------------------------------------------- настройки
 _env = Path(__file__).with_name(".env")  # для запуска на своём ПК; на хостинге задавайте переменные в панели
@@ -374,6 +375,9 @@ HELP = (
     "<b>Быстрый ввод</b>: длительность и формат можно указать прямо в команде:\n"
     "<code>/sd2 10s 9:16 неоновый Токио под дождём</code>\n\n"
     "Можно отправить альбом фото с подписью <code>/sd2 промпт</code>, тогда бот сразу добавит их как референсы.\n\n"
+    "🔲 <b>/grid</b> — наложить сетку на фото или видео: размер сетки, цвет (или свой HEX), толщина, "
+    "прозрачность, пунктир, диагонали, центр, рамка, подписи клеток, золотое сечение. "
+    "Можно ответить <code>/grid</code> на сообщение с фото или видео.\n\n"
     "/queue — очередь · /cancel — закрыть черновик"
 )
 
@@ -420,7 +424,12 @@ async def handle_batch(msgs: list[Message]):
             await first.answer("Открытого черновика нет.")
         return
 
+    if cmd == "grid":
+        await open_grid(msgs, uid, uname)
+        return
+
     if cmd in ("sd2", "sd2fast"):
+        active_tool[key] = "gen"
         old = drafts.get(key)
         if old:
             if old.panel_id:
@@ -452,6 +461,16 @@ async def handle_batch(msgs: list[Message]):
     if cmd:  # чужая/неизвестная команда
         return
 
+    # открыта панель сетки и она активна (или это ответ на неё) — файлы идут туда
+    g = grid_drafts.get(key)
+    if g:
+        reply_ids = {x.reply_to_message.message_id for x in msgs if x.reply_to_message}
+        to_grid = bool(reply_ids & {g.panel_id, g.ask_id}) or (
+            active_tool.get(key) == "grid" and not (key in drafts and reply_ids & {drafts[key].panel_id, drafts[key].ask_id})
+        )
+        if to_grid and await grid_incoming(g, msgs, raw):
+            return
+
     # обычное сообщение: текст = промпт, файлы = референсы
     d = drafts.get(key)
     if not d:
@@ -461,6 +480,7 @@ async def handle_batch(msgs: list[Message]):
         return
     reply_ids = {x.reply_to_message.message_id for x in msgs if x.reply_to_message}
     answered_ask = bool(d.ask_id and d.ask_id in reply_ids)
+    active_tool[key] = "gen"
     if not is_private(chat.type) and not (reply_ids & {d.panel_id, d.ask_id}):
         return
     has_media = any(extract_ref(x)[0] for x in msgs)
@@ -515,6 +535,7 @@ async def on_panel_button(cb: CallbackQuery):
     if not await may_control(d, cb):
         await cb.answer("Это не ваша панель 🙂 Свою можно открыть командой /sd2 или /sd2fast", show_alert=True)
         return
+    active_tool[draft_key(d)] = "gen"
 
     if action == "noop":
         await cb.answer()
@@ -776,6 +797,389 @@ async def on_job_button(cb: CallbackQuery):
         await show_panel(d)
 
 
+# ----------------------------------------------------------------- /grid: сетка на фото и видео
+GRID_MAX_VIDEO_SEC = int(os.getenv("GRID_MAX_VIDEO_SEC", "120"))
+grid_sem = asyncio.Semaphore(int(os.getenv("GRID_PARALLEL", "1")))
+
+
+@dataclass
+class GridDraft:
+    id: str
+    chat_id: int
+    chat_type: str
+    thread_id: int | None
+    owner_id: int
+    owner_name: str
+    mode: str = "photo"  # photo | video
+    cfg: GridCfg = field(default_factory=GridCfg)
+    media: Ref | None = None
+    panel_id: int | None = None
+    ask_id: int | None = None
+    more: bool = False
+    busy: bool = False
+    cancel: asyncio.Event = field(default_factory=asyncio.Event)
+    service_msgs: list[int] = field(default_factory=list)
+
+
+grid_drafts: dict[tuple[int, int | None, int], GridDraft] = {}
+grid_by_id: dict[str, GridDraft] = {}
+grid_prefs: dict[int, GridCfg] = {}  # последние настройки человека
+active_tool: dict[tuple[int, int | None, int], str] = {}  # куда отправлять файлы: "gen" | "grid"
+
+
+def grid_key(g: GridDraft):
+    return (g.chat_id, g.thread_id, g.owner_id)
+
+
+def media_ref(m: Message) -> Ref | None:
+    """Фото/видео из сообщения (для сетки)."""
+    ref, _ = extract_ref(m)
+    if ref and ref.kind in ("imgs", "vids"):
+        return ref
+    return None
+
+
+def grid_text(g: GridDraft) -> str:
+    c = g.cfg
+    what = "фото" if g.mode == "photo" else "видео"
+    if g.media:
+        file_line = f"✅ {'фото' if g.media.kind == 'imgs' else 'видео'} загружено"
+    else:
+        file_line = f"<i>пришлите {what}</i>"
+    extra = [n for f, n in ((c.diagonals, "диагонали"), (c.center, "центр"), (c.border, "рамка"), (c.labels, "подписи клеток")) if f]
+    lines = [
+        f"🔲 <b>Сетка на {what}</b>\n",
+        f"<b>Файл:</b> {file_line}",
+        f"<b>Сетка:</b> {'золотое сечение' if c.golden else f'{c.cols} × {c.rows}'}",
+        f"<b>Цвет:</b> {c.color_name()}",
+        f"<b>Линии:</b> {c.thickness} px · {c.opacity}% · {STYLES[c.style]}",
+        f"<b>Дополнительно:</b> {', '.join(extra) or 'нет'}",
+    ]
+    if g.mode == "video":
+        lines.append(f"<b>Размер видео:</b> {SIZES[c.size]}")
+    else:
+        lines.append(f"<b>Отправка:</b> {'файлом без сжатия' if c.as_file else 'фото'}")
+    hint = (
+        f"\n<i>Пришлите {what}, и я наложу на него сетку. Настройки можно менять и накладывать сетку заново сколько угодно раз.</i>"
+    )
+    if not is_private(g.chat_type):
+        hint += "\n<i>В группе и канале файлы отправляйте ответом (reply) на эту панель.</i>"
+    return "\n".join(lines) + "\n" + hint
+
+
+def grid_kb(g: GridDraft) -> InlineKeyboardMarkup:
+    c = g.cfg
+    p = f"g:{g.id}:"
+    btn = InlineKeyboardButton
+    pick = lambda ok, t: ("◉ " + t) if ok else ("○ " + t)  # noqa: E731
+    tick = lambda ok, t: ("☑ " + t) if ok else ("☐ " + t)  # noqa: E731
+    rows = [
+        [btn(text=pick(g.mode == "photo", "Фото"), callback_data=p + "mode:photo"),
+         btn(text=pick(g.mode == "video", "Видео"), callback_data=p + "mode:video")],
+        [btn(text="−", callback_data=p + "c:-1"), btn(text=f"Столбцы: {c.cols}", callback_data=p + "noop"),
+         btn(text="+", callback_data=p + "c:+1")],
+        [btn(text="−", callback_data=p + "r:-1"), btn(text=f"Строки: {c.rows}", callback_data=p + "noop"),
+         btn(text="+", callback_data=p + "r:+1")],
+        [btn(text=("◉ " if not c.golden and (c.cols, c.rows) == (n, n) else "") + f"{n}×{n}", callback_data=p + f"pre:{n}")
+         for n in (2, 3, 4, 6)]
+        + [btn(text=("◉ " if c.golden else "") + "φ", callback_data=p + "gold")],
+    ]
+    cols = list(COLORS.items())
+    for chunk in (cols[:4], cols[4:]):
+        row = [btn(text=(e + " ✓" if c.color == k else e), callback_data=p + f"col:{k}") for k, (e, _, _) in chunk]
+        rows.append(row)
+    rows[-1].append(btn(text="🎨 HEX ✓" if c.color.startswith("#") else "🎨 HEX", callback_data=p + "hex"))
+    rows.append([btn(text="⚙️ Скрыть настройки ▴" if g.more else "⚙️ Ещё настройки ▾", callback_data=p + "more")])
+    if g.more:
+        rows += [
+            [btn(text="−", callback_data=p + "th:-1"), btn(text=f"Толщина: {c.thickness} px", callback_data=p + "noop"),
+             btn(text="+", callback_data=p + "th:+1")],
+            [btn(text=("◉ " if c.opacity == v else "") + f"{v}%", callback_data=p + f"op:{v}") for v in (25, 50, 75, 100)],
+            [btn(text=pick(c.style == k, n.capitalize()), callback_data=p + f"st:{k}") for k, n in STYLES.items()],
+            [btn(text=tick(c.diagonals, "Диагонали"), callback_data=p + "t:diagonals"),
+             btn(text=tick(c.center, "Центр"), callback_data=p + "t:center")],
+            [btn(text=tick(c.border, "Рамка"), callback_data=p + "t:border"),
+             btn(text=tick(c.labels, "Подписи A1"), callback_data=p + "t:labels")],
+        ]
+        if g.mode == "video":
+            rows.append([btn(text=pick(c.size == k, n.capitalize()), callback_data=p + f"sz:{k}") for k, n in SIZES.items()])
+        else:
+            rows.append([btn(text=pick(not c.as_file, "Фото"), callback_data=p + "af:0"),
+                         btn(text=pick(c.as_file, "Файл без сжатия"), callback_data=p + "af:1")])
+        rows.append([btn(text="♻️ Сбросить настройки", callback_data=p + "reset")])
+    action = [btn(text="✅ Наложить сетку", callback_data=p + "go")]
+    if g.mode == "video":
+        action.append(btn(text="👁 Превью кадра", callback_data=p + "pv"))
+    rows.append(action)
+    last = [btn(text="✖️ Закрыть", callback_data=p + "x")]
+    if g.media:
+        last.insert(0, btn(text="🗑 Убрать файл", callback_data=p + "clr"))
+    rows.append(last)
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def show_grid(g: GridDraft, *, resend: bool = False):
+    text, kb = grid_text(g), grid_kb(g)
+    if g.panel_id and (not resend or g.chat_type == ChatType.CHANNEL):
+        r = await safe(bot.edit_message_text(text=text, chat_id=g.chat_id, message_id=g.panel_id, reply_markup=kb))
+        if r is not None or not resend:
+            return
+    if g.panel_id:
+        await safe(bot.delete_message(g.chat_id, g.panel_id))
+    msg = await bot.send_message(g.chat_id, text, reply_markup=kb, message_thread_id=g.thread_id)
+    g.panel_id = msg.message_id
+
+
+def drop_grid(g: GridDraft):
+    grid_drafts.pop(grid_key(g), None)
+    grid_by_id.pop(g.id, None)
+
+
+def set_grid_media(g: GridDraft, ref: Ref):
+    g.media = ref
+    g.mode = "photo" if ref.kind == "imgs" else "video"
+
+
+async def open_grid(msgs: list[Message], uid: int, uname: str):
+    first = msgs[0]
+    key = (first.chat.id, thread_of(first), uid)
+    old = grid_drafts.get(key)
+    if old:
+        if old.panel_id:
+            await safe(bot.delete_message(old.chat_id, old.panel_id))
+        drop_grid(old)
+    base = grid_prefs.get(uid)
+    g = GridDraft(
+        id=uuid.uuid4().hex[:10], chat_id=first.chat.id, chat_type=first.chat.type, thread_id=thread_of(first),
+        owner_id=uid, owner_name=uname, cfg=GridCfg(**vars(base)) if base else GridCfg(),
+    )
+    g.service_msgs.extend(x.message_id for x in msgs)
+    # файл в самом сообщении с командой или в сообщении, на которое ответили
+    sources = list(msgs)
+    if first.reply_to_message:
+        sources.append(first.reply_to_message)
+    ref = next((r for r in map(media_ref, sources) if r), None)
+    if ref:
+        set_grid_media(g, ref)
+    grid_drafts[key] = g
+    grid_by_id[g.id] = g
+    active_tool[key] = "grid"
+    await show_grid(g)
+
+
+async def grid_incoming(g: GridDraft, msgs: list[Message], raw: str) -> bool:
+    """Обычное сообщение, пока открыта панель сетки. True — сообщение обработано."""
+    first = msgs[0]
+    reply_ids = {x.reply_to_message.message_id for x in msgs if x.reply_to_message}
+    if not is_private(g.chat_type) and not (reply_ids & {g.panel_id, g.ask_id}):
+        return False
+    ref = next((r for r in map(media_ref, msgs) if r), None)
+    if ref:
+        set_grid_media(g, ref)
+        g.service_msgs.extend(x.message_id for x in msgs)
+        await show_grid(g, resend=True)
+        return True
+    if extract_ref(first)[1]:
+        await safe(first.answer(extract_ref(first)[1]))
+        return True
+    if raw:
+        rgb = parse_hex(raw)
+        if rgb:
+            g.cfg.color = "#%02x%02x%02x" % rgb
+            if g.ask_id:
+                await safe(bot.delete_message(g.chat_id, g.ask_id))
+                g.ask_id = None
+            for x in msgs:
+                await safe(bot.delete_message(g.chat_id, x.message_id))
+            await show_grid(g)
+        elif g.ask_id and g.ask_id in reply_ids:
+            await safe(first.answer("Не понял цвет. Пришлите HEX, например <code>#FF3B30</code> или <code>0af</code>."))
+        else:
+            await safe(first.answer("Пришлите фото или видео: на него я наложу сетку. Цвет можно задать в HEX, например <code>#00FFAA</code>."))
+        return True
+    if any(extract_ref(x)[0] for x in msgs):  # аудио и т.п.
+        await safe(first.answer("Сетку можно наложить только на фото или видео."))
+        return True
+    return False
+
+
+@router.callback_query(F.data.startswith("g:"))
+async def on_grid_button(cb: CallbackQuery):
+    _, gid, action, *arg = cb.data.split(":", 3)
+    arg = arg[0] if arg else ""
+    g = grid_by_id.get(gid)
+    if not g:
+        await cb.answer("Панель устарела — откройте заново: /grid", show_alert=True)
+        return
+    if not await may_control(g, cb):  # type: ignore[arg-type]
+        await cb.answer("Это не ваша панель. Свою можно открыть командой /grid", show_alert=True)
+        return
+    c = g.cfg
+    active_tool[grid_key(g)] = "grid"
+    if action == "noop":
+        await cb.answer()
+        return
+    if action == "mode":
+        g.mode = arg
+        if g.media and (g.media.kind == "imgs") != (arg == "photo"):
+            g.media = None
+    elif action == "c":
+        c.cols, c.golden = max(1, min(20, c.cols + int(arg))), False
+    elif action == "r":
+        c.rows, c.golden = max(1, min(20, c.rows + int(arg))), False
+    elif action == "pre":
+        c.cols = c.rows = int(arg)
+        c.golden = False
+    elif action == "gold":
+        c.golden = not c.golden
+    elif action == "col":
+        c.color = arg if arg in COLORS else c.color
+    elif action == "hex":
+        await grid_ask_hex(g)
+        await cb.answer()
+        return
+    elif action == "more":
+        g.more = not g.more
+    elif action == "th":
+        c.thickness = max(1, min(20, c.thickness + int(arg)))
+    elif action == "op":
+        c.opacity = int(arg)
+    elif action == "st":
+        c.style = arg if arg in STYLES else c.style
+    elif action == "t":
+        setattr(c, arg, not getattr(c, arg))
+    elif action == "sz":
+        c.size = arg if arg in SIZES else c.size
+    elif action == "af":
+        c.as_file = arg == "1"
+    elif action == "reset":
+        g.cfg = GridCfg()
+        grid_prefs.pop(cb.from_user.id, None)
+    elif action == "clr":
+        g.media = None
+    elif action == "x":
+        await safe(cb.message.delete())
+        if g.ask_id:
+            await safe(bot.delete_message(g.chat_id, g.ask_id))
+        drop_grid(g)
+        await cb.answer("Закрыто")
+        return
+    elif action in ("go", "pv"):
+        await grid_apply(g, cb, preview=action == "pv")
+        return
+    elif action == "stop":
+        g.cancel.set()
+        await cb.answer("Останавливаю…")
+        return
+    await safe(cb.message.edit_text(grid_text(g), reply_markup=grid_kb(g)))
+    await cb.answer()
+
+
+async def grid_ask_hex(g: GridDraft):
+    if g.ask_id:
+        await safe(bot.delete_message(g.chat_id, g.ask_id))
+    markup = None if g.chat_type == ChatType.CHANNEL else ForceReply(input_field_placeholder="#FF3B30")
+    msg = await safe(bot.send_message(
+        g.chat_id,
+        "🎨 <b>Пришлите цвет в HEX</b> ответом на это сообщение.\nНапример: <code>#FF3B30</code>, <code>#00FFAA</code>, <code>fff</code>.",
+        reply_markup=markup, message_thread_id=g.thread_id,
+    ))
+    if msg:
+        g.ask_id = msg.message_id
+        g.service_msgs.append(msg.message_id)
+
+
+async def grid_apply(g: GridDraft, cb: CallbackQuery, preview: bool = False):
+    if not g.media:
+        await cb.answer(f"Сначала пришлите {'фото' if g.mode == 'photo' else 'видео'}.", show_alert=True)
+        return
+    if g.busy:
+        await cb.answer("Уже обрабатываю, подождите.", show_alert=True)
+        return
+    g.busy = True
+    g.cancel = asyncio.Event()
+    grid_prefs[cb.from_user.id] = GridCfg(**vars(g.cfg))
+    await cb.answer("Делаю превью…" if preview else "Накладываю сетку…")
+    tmp = Path(tempfile.mkdtemp(prefix="grid_"))
+    status_id = None
+    c = GridCfg(**vars(g.cfg))
+    caption = f"🔲 <b>Сетка</b> · {html.escape(c.summary())}"
+    try:
+        src = tmp / ("src" + Path(g.media.name).suffix if Path(g.media.name).suffix else "src.bin")
+        await bot.download(g.media.file_id, destination=src)
+        if g.media.kind == "imgs":
+            out = await asyncio.to_thread(apply_photo, src, tmp, c)
+            if c.as_file or out.stat().st_size > 9_500_000:
+                await tg(lambda: bot.send_document(g.chat_id, FSInputFile(out, filename=f"grid{out.suffix}"),
+                                                    caption=caption, message_thread_id=g.thread_id))
+            else:
+                await tg(lambda: bot.send_photo(g.chat_id, FSInputFile(out), caption=caption, message_thread_id=g.thread_id))
+        elif preview:
+            out = await grid_preview(src, tmp, c)
+            await tg(lambda: bot.send_photo(g.chat_id, FSInputFile(out), caption="👁 Превью первого кадра\n" + caption,
+                                             message_thread_id=g.thread_id))
+        else:
+            info = await probe(src)
+            if info["duration"] > GRID_MAX_VIDEO_SEC:
+                raise RuntimeError(f"видео длиннее {GRID_MAX_VIDEO_SEC} сек — обрежьте его и пришлите снова")
+            st = await bot.send_message(g.chat_id, "🔲 Накладываю сетку на видео…", message_thread_id=g.thread_id,
+                                        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
+                                            text="✖️ Остановить", callback_data=f"g:{g.id}:stop")]]))
+            status_id = st.message_id
+            t0 = time.monotonic()
+            last = [0.0]
+            stop_kb = st.reply_markup
+
+            async def on_progress(frac: float):
+                now = time.monotonic()
+                if now - last[0] < 3:
+                    return
+                last[0] = now
+                el = now - t0
+                left = el / frac - el if frac > 0.03 else 0
+                await safe(bot.edit_message_text(
+                    chat_id=g.chat_id, message_id=status_id, reply_markup=stop_kb,
+                    text=(f"🔲 <b>Накладываю сетку на видео</b>\n\n<code>{bar(frac)}</code> <b>{int(frac * 100)}%</b>\n\n"
+                          f"⏱ Прошло: <b>{fmt_t(el)}</b>" + (f" · Осталось: <b>≈ {fmt_t(left)}</b>" if left else "")),
+                ))
+
+            async with grid_sem:
+                out = await apply_video(src, tmp, c, on_progress, cancel=g.cancel)
+            size = out.stat().st_size
+            if size > TG_UPLOAD_LIMIT:
+                raise RuntimeError("готовое видео больше 50 МБ — выберите размер 720p в «Ещё настройки»")
+            await safe(bot.edit_message_text(chat_id=g.chat_id, message_id=status_id,
+                                             text=f"🔲 Готово, отправляю…\n\n<code>{bar(1)}</code> <b>100%</b>"))
+            await tg(lambda: bot.send_video(g.chat_id, FSInputFile(out, filename="grid.mp4"), caption=caption,
+                                             supports_streaming=True, message_thread_id=g.thread_id, request_timeout=300))
+        if status_id:
+            await safe(bot.delete_message(g.chat_id, status_id))
+        if g.chat_type == ChatType.CHANNEL and CHANNEL_CLEANUP and not preview:
+            for mid in [g.panel_id, *g.service_msgs]:
+                await safe(bot.delete_message(g.chat_id, mid))
+            drop_grid(g)
+        else:
+            await show_grid(g, resend=True)  # панель снова внизу: можно поменять настройки и наложить ещё раз
+    except GridStopped:
+        if status_id:
+            await safe(bot.edit_message_text(chat_id=g.chat_id, message_id=status_id, text="✖️ Остановлено"))
+    except Exception as e:  # noqa: BLE001
+        log.warning("grid %s: %s", g.id, e)
+        text = f"❌ Не получилось наложить сетку: {html.escape(short(str(e), 400))}"
+        if status_id:
+            await safe(bot.edit_message_text(chat_id=g.chat_id, message_id=status_id, text=text))
+        else:
+            await safe(bot.send_message(g.chat_id, text, message_thread_id=g.thread_id))
+    finally:
+        g.busy = False
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+async def grid_preview(src: Path, tmp: Path, c: GridCfg) -> Path:
+    async with grid_sem:
+        return await preview_video(src, tmp, c)
+
+
 # ----------------------------------------------------------------- воркер
 async def worker(n: int):
     while True:
@@ -983,12 +1387,13 @@ async def setup_menu():
     private_cmds = [
         BotCommand(command="sd2fast", description="🎬 Видео SD 2 Fast — быстрее"),
         BotCommand(command="sd2", description="🎬 Видео SD 2 — больше деталей"),
+        BotCommand(command="grid", description="🔲 Сетка на фото или видео"),
         BotCommand(command="queue", description="📊 Очередь генераций"),
         BotCommand(command="cancel", description="✖️ Закрыть черновик"),
         BotCommand(command="help", description="❓ Как пользоваться"),
         BotCommand(command="start", description="🏠 Начало"),
     ]
-    group_cmds = private_cmds[:4]
+    group_cmds = private_cmds[:5]
     for scope, cmds in (
         (BotCommandScopeDefault(), private_cmds),
         (BotCommandScopeAllPrivateChats(), private_cmds),
