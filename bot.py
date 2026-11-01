@@ -81,6 +81,7 @@ RATIOS = ["16:9", "9:16", "1:1"]
 DUR_MIN, DUR_MAX = 4, 15
 TG_DOWNLOAD_LIMIT = 20 * 1024 * 1024  # Bot API отдаёт боту файлы до 20 МБ
 TG_UPLOAD_LIMIT = 49 * 1024 * 1024  # и принимает до 50 МБ
+REF_MIN_SEC, REF_MAX_TOTAL = 2, 15  # Seedance 2.0: каждое видео/аудио 2–15 сек, вместе ≤ 15 сек
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("bot")
@@ -99,6 +100,7 @@ class Ref:
     kind: str  # imgs | vids | auds
     file_id: str
     name: str
+    duration: float | None = None  # сек, если Telegram сообщил
 
 
 @dataclass
@@ -223,19 +225,19 @@ def extract_ref(m: Message) -> tuple[Ref | None, str | None]:
         ref, size = Ref("imgs", p.file_id, f"{p.file_unique_id}.jpg"), p.file_size
     elif m.video:
         v = m.video
-        ref, size = Ref("vids", v.file_id, v.file_name or f"{v.file_unique_id}.mp4"), v.file_size
+        ref, size = Ref("vids", v.file_id, v.file_name or f"{v.file_unique_id}.mp4", v.duration), v.file_size
     elif m.animation:
         a = m.animation
-        ref, size = Ref("vids", a.file_id, f"{a.file_unique_id}.mp4"), a.file_size
+        ref, size = Ref("vids", a.file_id, f"{a.file_unique_id}.mp4", a.duration), a.file_size
     elif m.video_note:
         v = m.video_note
-        ref, size = Ref("vids", v.file_id, f"{v.file_unique_id}.mp4"), v.file_size
+        ref, size = Ref("vids", v.file_id, f"{v.file_unique_id}.mp4", v.duration), v.file_size
     elif m.audio:
         a = m.audio
-        ref, size = Ref("auds", a.file_id, a.file_name or f"{a.file_unique_id}.mp3"), a.file_size
+        ref, size = Ref("auds", a.file_id, a.file_name or f"{a.file_unique_id}.mp3", a.duration), a.file_size
     elif m.voice:
         v = m.voice
-        ref, size = Ref("auds", v.file_id, f"{v.file_unique_id}.ogg"), v.file_size
+        ref, size = Ref("auds", v.file_id, f"{v.file_unique_id}.ogg", v.duration), v.file_size
     elif m.document:
         d = m.document
         mime = d.mime_type or ""
@@ -589,10 +591,20 @@ def add_refs(d: Draft, msgs: list[Message]) -> str:
             warns.append(err)
         if not ref:
             continue
+        name = {"imgs": "фото", "vids": "видео", "auds": "аудио"}[ref.kind]
         if d.count(ref.kind) >= REF_LIMITS[ref.kind]:
-            name = {"imgs": "фото", "vids": "видео", "auds": "аудио"}[ref.kind]
             warns.append(f"Лимит {name}: не больше {REF_LIMITS[ref.kind]}, лишнее не добавил.")
             continue
+        if ref.kind in ("vids", "auds") and ref.duration is not None:
+            if ref.duration < REF_MIN_SEC:
+                warns.append(f"{name.capitalize()} короче {REF_MIN_SEC} сек не подойдёт: модель принимает "
+                             f"{name}-референсы от {REF_MIN_SEC} до {REF_MAX_TOTAL} сек. Это {name} не добавил.")
+                continue
+            total = sum(r.duration or 0 for r in d.refs if r.kind == ref.kind) + ref.duration
+            if ref.duration > REF_MAX_TOTAL:
+                warns.append(f"{name.capitalize()} длиннее {REF_MAX_TOTAL} сек: при генерации возьму только начало.")
+            elif total > REF_MAX_TOTAL:
+                warns.append(f"Все {name}-референсы вместе не могут быть длиннее {REF_MAX_TOTAL} сек: лишнее обрежу.")
         d.refs.append(ref)
     return "\n".join(dict.fromkeys(warns))
 
@@ -1383,6 +1395,9 @@ async def run_job(job: Job):
             p = tmp / f"{i:02d}_{safe_name}"
             await bot.download(r.file_id, destination=p)
             files[r.kind].append(p)
+        for kind in ("vids", "auds"):
+            if files[kind]:
+                files[kind] = await fit_media_refs(job, kind, files[kind])
         url = await engine.generate(
             model=d.model,
             prompt=d.prompt,
@@ -1404,6 +1419,7 @@ async def run_job(job: Job):
         usage[(today(), job.user_id)] = max(0, used_today(job.user_id) - 1)
     except GenerationError as e:
         tick.cancel()
+        log.warning("job %s: генерация не удалась: %s", job.id, e)
         await fail(job, str(e))
     except Exception as e:  # noqa: BLE001
         tick.cancel()
@@ -1412,6 +1428,69 @@ async def run_job(job: Job):
     finally:
         tick.cancel()
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+async def media_duration(p: Path) -> float | None:
+    proc = await asyncio.create_subprocess_exec(
+        "ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1", str(p),
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+    )
+    out, _ = await proc.communicate()
+    try:
+        return float(out.decode().strip())
+    except ValueError:
+        return None
+
+
+async def ffmpeg(*args: str) -> bool:
+    proc = await asyncio.create_subprocess_exec("ffmpeg", "-y", "-v", "error", *args,
+                                                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
+    _, err = await proc.communicate()
+    if proc.returncode != 0:
+        log.warning("ffmpeg %s: %s", args[-1], err.decode(errors="replace")[-300:])
+    return proc.returncode == 0
+
+
+async def fit_media_refs(job: Job, kind: str, paths: list[Path]) -> list[Path]:
+    """Подгоняем видео/аудио-референсы под правила модели: каждый 2–15 сек, вместе ≤ 15 сек.
+    Длинные обрезаем, слишком короткие и лишние убираем; аудио приводим к mp3."""
+    name = "видео" if kind == "vids" else "аудио"
+    budget = float(REF_MAX_TOTAL)
+    out: list[Path] = []
+    for i, p in enumerate(paths, 1):
+        dur = await media_duration(p)
+        if dur is None:
+            out.append(p)
+            continue
+        if dur < REF_MIN_SEC:
+            raise GenerationError(f"{name}-референс №{i} короче {REF_MIN_SEC} сек ({dur:.1f} с), "
+                                  f"модель принимает {name} от {REF_MIN_SEC} до {REF_MAX_TOTAL} сек")
+        allowed = min(float(REF_MAX_TOTAL), budget)
+        if allowed < REF_MIN_SEC:
+            log.info("убираю %s-референс №%s: лимит %s сек на все исчерпан", name, i, REF_MAX_TOTAL)
+            job.detail, job.dirty = f"{name.capitalize()}-референс №{i} не влез в лимит {REF_MAX_TOTAL} сек, пропускаю", True
+            continue
+        need_audio_conv = kind == "auds" and p.suffix.lower() not in (".mp3", ".wav")
+        if dur > allowed + 0.05 or need_audio_conv:
+            cut = min(dur, allowed - 0.15) if dur > allowed + 0.05 else dur
+            if dur > allowed + 0.05:
+                job.detail, job.dirty = f"Обрезаю {name}-референс №{i} до {round(cut)} сек (было {round(dur)})", True
+            if kind == "vids":
+                dst = p.with_name(p.stem + "_cut.mp4")
+                ok = await ffmpeg("-i", str(p), "-t", f"{cut:.2f}", "-c", "copy", "-movflags", "+faststart", str(dst))
+                d2 = await media_duration(dst) if ok else None
+                if not ok or d2 is None or d2 > allowed:
+                    ok = await ffmpeg("-i", str(p), "-t", f"{cut:.2f}", "-c:v", "libx264", "-preset", "veryfast",
+                                      "-crf", "20", "-c:a", "aac", "-movflags", "+faststart", str(dst))
+            else:
+                dst = p.with_name(p.stem + "_cut.mp3")
+                ok = await ffmpeg("-i", str(p), "-t", f"{cut:.2f}", "-vn", "-c:a", "libmp3lame", "-q:a", "2", str(dst))
+            if not ok:
+                raise GenerationError(f"не получилось подготовить {name}-референс №{i}")
+            p, dur = dst, (await media_duration(dst)) or cut
+        budget -= dur
+        out.append(p)
+    return out
 
 
 async def fail(job: Job, reason: str):
@@ -1427,7 +1506,7 @@ async def fail(job: Job, reason: str):
     await set_status(
         job,
         "❌ <b>Не получилось</b>" + (f" на этапе «{stage}»" if stage else "") + "\n\n"
-        f"{html.escape(short(reason, 500))}\n\n" + params_block(job.draft),
+        f"{html.escape(short(reason, 1500))}\n\n" + params_block(job.draft),
         kb=kb,
     )
 
