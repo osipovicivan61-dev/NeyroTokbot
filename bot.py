@@ -49,6 +49,7 @@ from aiogram.types import (
 from aiohttp import web
 
 from engine import REF_LIMITS, Cancelled, GenerationError, make_engine
+from watermark import apply_watermark
 from grid import COLORS, SIZES, STYLES, GridCfg, GridStopped, apply_photo, apply_video, parse_hex, preview_video, probe
 
 # ----------------------------------------------------------------- настройки
@@ -73,6 +74,7 @@ DEFAULT_RATIO = os.getenv("DEFAULT_RATIO", "16:9")
 WEBHOOK_BASE = os.getenv("WEBHOOK_URL") or os.getenv("RENDER_EXTERNAL_URL") or ""
 PORT = int(os.getenv("PORT", "0") or 0)
 BOT_NAME = os.getenv("BOT_NAME", "NeyroTokBot")
+WATERMARK = os.getenv("WATERMARK", "1") == "1"  # водяной знак NeyroTok на готовых видео
 
 MODELS = {"sd2": "SD 2", "fast": "SD 2 Fast"}
 RATIOS = ["16:9", "9:16", "1:1"]
@@ -139,6 +141,9 @@ class Job:
     gen_took: float = 0.0
     dirty: bool = True
     last_push: float = 0.0
+    send_frac: float = 0.0
+    author: str = ""  # для водяного знака: @username того, кто запустил
+    tick: asyncio.Task | None = None
 
 
 drafts: dict[tuple[int, int | None, int], Draft] = {}
@@ -697,6 +702,12 @@ def user_active(uid: int) -> int:
     return sum(1 for j in [*pending, *running_jobs()] if j.user_id == uid and not j.cancel.is_set())
 
 
+def author_of(u) -> str:
+    if u.username:
+        return "@" + u.username
+    return short(u.full_name or "", 28)
+
+
 def running_jobs() -> list[Job]:
     return [j for j in jobs.values() if j.running]
 
@@ -718,7 +729,7 @@ async def start_job(d: Draft, cb: CallbackQuery):
         await safe(bot.delete_message(d.chat_id, d.ask_id))
         d.ask_id = None
     drop_draft(d)
-    job = Job(id=uuid.uuid4().hex[:10], draft=d, status_msg_id=d.panel_id, user_id=uid)
+    job = Job(id=uuid.uuid4().hex[:10], draft=d, status_msg_id=d.panel_id, user_id=uid, author=author_of(cb.from_user))
     jobs[job.id] = job
     pending.append(job)
     await queue.put(job)
@@ -769,7 +780,7 @@ def progress(job: Job) -> float:
         x = (time.monotonic() - job.gen_started) / max(1.0, expected_gen(job.draft))
         f = 0.9 * x if x <= 1 else 0.9 + 0.08 * (1 - math.exp(-2 * (x - 1)))
         return 0.12 + 0.83 * f
-    return 0.97
+    return 0.95 + 0.04 * job.send_frac
 
 
 def params_block(d: Draft) -> str:
@@ -875,7 +886,8 @@ async def on_job_button(cb: CallbackQuery):
         if job.running or job in pending:
             await cb.answer("Уже в работе")
             return
-        new = Job(id=uuid.uuid4().hex[:10], draft=d, status_msg_id=job.status_msg_id, user_id=cb.from_user.id)
+        new = Job(id=uuid.uuid4().hex[:10], draft=d, status_msg_id=job.status_msg_id, user_id=cb.from_user.id,
+                  author=author_of(cb.from_user))
         jobs.pop(jid, None)
         jobs[new.id] = new
         pending.append(new)
@@ -1342,6 +1354,7 @@ async def run_job(job: Job):
     tmp = Path(tempfile.mkdtemp(prefix="okr_"))
     await push_status(job)
     tick = asyncio.create_task(ticker(job))
+    job.tick = tick
 
     async def on_status(stage: str, detail: str = ""):
         if stage == "generate":
@@ -1382,9 +1395,8 @@ async def run_job(job: Job):
         if job.gen_started:
             job.gen_took = time.monotonic() - job.gen_started
             learn_speed(d, job.gen_took)
-        job.stage, job.detail = "send", "Видео готово, загружаю в Telegram"
-        await push_status(job)
-        tick.cancel()
+        job.stage, job.detail = "send", "Видео готово, скачиваю с сайта"
+        job.dirty = True
         await deliver(job, url, tmp)
     except Cancelled:
         tick.cancel()
@@ -1449,6 +1461,22 @@ async def deliver(job: Job, url: str, tmp: Path):
         log.warning("не скачал видео %s: %s", url, e)
         size = -1
 
+    if WATERMARK and 0 < size <= TG_UPLOAD_LIMIT:
+        job.detail, job.send_frac, job.dirty = "Добавляю водяной знак NeyroTok", 0.0, True
+
+        async def wm_progress(f: float):
+            job.detail, job.send_frac, job.dirty = f"Добавляю водяной знак NeyroTok: {int(f * 100)}%", f * 0.8, True
+
+        try:
+            marked = await apply_watermark(path, tmp / "result_wm.mp4", job.author, wm_progress)
+            if marked.stat().st_size <= TG_UPLOAD_LIMIT:
+                path, size = marked, marked.stat().st_size
+            else:
+                log.warning("видео со знаком больше 50 МБ, отправляю без знака")
+        except Exception as e:  # noqa: BLE001
+            log.warning("водяной знак не наложился: %s", e)
+    job.detail, job.send_frac, job.dirty = "Загружаю в Telegram", 0.85, True
+
     link_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬇️ Скачать видео", url=url)]])
     sent = None
     if 0 < size <= TG_UPLOAD_LIMIT:
@@ -1469,6 +1497,8 @@ async def deliver(job: Job, url: str, tmp: Path):
             reply_markup=link_kb, reply_parameters=reply, message_thread_id=d.thread_id,
         ))
 
+    if job.tick:
+        job.tick.cancel()
     if d.chat_type == ChatType.CHANNEL and CHANNEL_CLEANUP:
         for mid in [job.status_msg_id, *d.service_msgs]:
             await safe(bot.delete_message(d.chat_id, mid))

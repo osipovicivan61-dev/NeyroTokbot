@@ -12,6 +12,7 @@ RUN apt-get update \
  && playwright install --with-deps --only-shell chromium \
  && rm -rf /var/lib/apt/lists/*
 
-COPY bot.py engine.py grid.py ./
+COPY bot.py engine.py grid.py watermark.py ./
+COPY fonts ./fonts
 
 CMD ["python", "bot.py"]
