@@ -857,11 +857,11 @@ async def push_status(job: Job):
 
 
 async def ticker(job: Job):
-    """Обновляет статус: сразу при смене этапа (не чаще раза в 2 сек) и раз в 5 сек — время и шкалу."""
+    """Обновляет статус: при изменениях не чаще раза в 3.5 сек, иначе раз в 7 сек (лимиты Telegram на правки)."""
     while True:
         await asyncio.sleep(1)
         since = time.monotonic() - getattr(job, "last_push", 0)
-        if (job.dirty and since >= 2) or since >= 5:
+        if (job.dirty and since >= 3.5) or since >= 7:
             await push_status(job)
 
 
