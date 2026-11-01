@@ -112,17 +112,34 @@ class BrowserEngine(BaseEngine):
         page = await self._context.new_page()
         try:
             await on_status("🌐 Открываю сайт…")
-            # Сайт на Render free может «спать» — даём до 3 минут на пробуждение.
-            for attempt in range(3):
+            # Сайт на Render free может «спать»: пока он просыпается, Render отдаёт
+            # страницу-заставку. Ждём до ~5 минут, пока не появится настоящая форма.
+            deadline = time.monotonic() + 300
+            attempt = 0
+            while True:
+                attempt += 1
                 try:
-                    await page.goto(self.site_url, wait_until="domcontentloaded", timeout=180_000)
-                    await page.wait_for_selector("#go", timeout=60_000)
+                    if attempt == 1:
+                        await page.goto(self.site_url, wait_until="domcontentloaded", timeout=120_000)
+                    else:
+                        await page.reload(wait_until="domcontentloaded", timeout=120_000)
+                    await page.wait_for_selector("#go", state="attached", timeout=45_000)
                     break
                 except Exception as e:  # noqa: BLE001
-                    if attempt == 2:
-                        raise GenerationError(f"сайт не открылся: {e}") from e
-                    await on_status("😴 Сайт просыпается, пробую ещё раз…")
-                    await asyncio.sleep(5)
+                    if cancel.is_set():
+                        raise Cancelled()
+                    if time.monotonic() > deadline:
+                        try:
+                            title = (await page.title()) or "без заголовка"
+                            text = (await page.evaluate("document.body ? document.body.innerText.slice(0,150) : ''")).strip()
+                        except Exception:  # noqa: BLE001
+                            title, text = "?", ""
+                        raise GenerationError(
+                            f"сайт не открылся за 5 минут (открылось: «{title}» {text!r}). "
+                            "Попробуйте позже или включите ENGINE=direct"
+                        ) from e
+                    await on_status(f"😴 Сайт просыпается, жду… (попытка {attempt})")
+                    await asyncio.sleep(10)
 
             # ждём, пока сайт сам получит ключ доступа
             try:
@@ -219,17 +236,38 @@ class DirectEngine(BaseEngine):
             headers={"User-Agent": "Mozilla/5.0 (OkroshkaTelegramBot)"},
         )
 
+    async def _wake(self, c: httpx.AsyncClient, on_status: StatusCb, cancel: asyncio.Event) -> None:
+        """Будим сайт: пока Render его поднимает, вместо формы приходит заставка или 5xx."""
+        deadline = time.monotonic() + 300
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                r = await c.get("/")
+                if r.status_code == 200 and ("/api/run" in r.text or 'id="go"' in r.text or "id=go" in r.text):
+                    return
+                reason = f"HTTP {r.status_code}"
+            except httpx.HTTPError as e:
+                reason = type(e).__name__
+            if cancel.is_set():
+                raise Cancelled()
+            if time.monotonic() > deadline:
+                raise GenerationError(f"сайт не отвечает 5 минут ({reason}). Попробуйте позже")
+            await on_status(f"😴 Сайт просыпается, жду… (попытка {attempt})")
+            await asyncio.sleep(10)
+
     async def _new_key(self, c: httpx.AsyncClient) -> str:
         r = await c.post("/api/keys")
-        key = (r.json() or {}).get("key", "")
+        key = _json(r).get("key", "")
         if not key:
-            raise GenerationError("сайт не выдал ключ доступа")
+            raise GenerationError(f"сайт не выдал ключ доступа (HTTP {r.status_code})")
         self._key = key
         return key
 
     async def generate(self, *, model, prompt, duration, ratio, refs, on_status, cancel) -> str:
         async with self._client() as c:
             await on_status("🌐 Подключаюсь к сайту…")
+            await self._wake(c, on_status, cancel)
             key = self._key or await self._new_key(c)
 
             uploaded = []

@@ -10,7 +10,7 @@ services:
       - key: ADMIN_IDS
         sync: false        # ваш Telegram ID (без лимитов)
       - key: ENGINE
-        value: browser     # browser = через сайт в браузере, direct = лёгкий режим
+        value: direct      # direct = лёгкий режим (для free-тарифа), browser = через Chromium
       - key: MAX_PARALLEL
         value: "1"
       - key: DAILY_LIMIT
