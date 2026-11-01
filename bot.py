@@ -24,6 +24,7 @@ import tempfile
 import time
 import uuid
 from dataclasses import dataclass, field
+import math
 from pathlib import Path
 
 import httpx
@@ -36,6 +37,7 @@ from aiogram.types import (
     CallbackQuery,
     FSInputFile,
     InlineKeyboardButton,
+    ForceReply,
     InlineKeyboardMarkup,
     Message,
     ReplyParameters,
@@ -107,6 +109,7 @@ class Draft:
     panel_id: int | None = None
     source_msg_id: int | None = None
     service_msgs: list[int] = field(default_factory=list)  # что удалить в канале после публикации
+    ask_id: int | None = None  # сообщение «напишите промпт»
 
     def count(self, kind: str) -> int:
         return sum(1 for r in self.refs if r.kind == kind)
@@ -121,6 +124,14 @@ class Job:
     cancel: asyncio.Event = field(default_factory=asyncio.Event)
     started_at: float = 0.0
     running: bool = False
+    # прогресс
+    stage: str = "queue"  # queue | prep | gen | send
+    detail: str = ""
+    prep_frac: float = 0.0
+    gen_started: float = 0.0
+    gen_took: float = 0.0
+    dirty: bool = True
+    last_push: float = 0.0
 
 
 drafts: dict[tuple[int, int], Draft] = {}
@@ -270,51 +281,50 @@ async def is_chat_admin(chat_id: int, user_id: int) -> bool:
 
 
 # ----------------------------------------------------------------- панель
+def refs_summary(d: Draft) -> str:
+    parts = [f"{d.count(k)} {n}" for k, n in (("imgs", "фото"), ("vids", "видео"), ("auds", "аудио")) if d.count(k)]
+    return " · ".join(parts) or "нет"
+
+
 def panel_text(d: Draft) -> str:
-    refs = " · ".join(
-        f"{d.count(k)} {name}" for k, name in (("imgs", "фото"), ("vids", "видео"), ("auds", "аудио"))
+    if d.prompt:
+        prompt = f"<blockquote expandable>{html.escape(short(d.prompt, 900))}</blockquote>"
+    else:
+        prompt = "<i>Не задан. Нажмите «✏️ Написать промпт» или просто отправьте текст.</i>"
+    where = (
+        "" if is_private(d.chat_type)
+        else "\n<i>В группе и канале текст и файлы отправляйте ответом (reply) на эту панель.</i>"
     )
-    prompt = html.escape(short(d.prompt, 700)) if d.prompt else "<i>не задан — пришлите текстом</i>"
-    where = "" if is_private(d.chat_type) else "\n<i>В группе/канале отправляйте текст и файлы ответом (reply) на эту панель.</i>"
     return (
-        f"🎬 <b>{MODELS[d.model]}</b> · черновик\n\n"
-        f"📝 <b>Промпт:</b> {prompt}\n"
-        f"⏱ <b>Длительность:</b> {d.duration} сек\n"
-        f"🖼 <b>Формат:</b> {d.ratio}\n"
-        f"📎 <b>Референсы:</b> {refs}\n\n"
-        f"Пришлите фото / видео / аудио — добавлю как референсы "
-        f"(до {REF_LIMITS['imgs']} фото, {REF_LIMITS['vids']} видео, {REF_LIMITS['auds']} аудио).\n"
-        f"Пришлите текст — заменю промпт.{where}"
+        f"🎬 <b>Новое видео</b>\n\n"
+        f"<b>Модель:</b> {MODELS[d.model]}\n"
+        f"<b>Длительность:</b> {d.duration} сек\n"
+        f"<b>Формат:</b> {d.ratio}\n"
+        f"<b>Референсы:</b> {refs_summary(d)}\n\n"
+        f"<b>Промпт</b>\n{prompt}\n\n"
+        f"<i>Пришлите фото, видео или аудио, и я добавлю их как референсы "
+        f"(до {REF_LIMITS['imgs']} фото, {REF_LIMITS['vids']} видео, {REF_LIMITS['auds']} аудио).</i>{where}"
     )
 
 
 def panel_kb(d: Draft) -> InlineKeyboardMarkup:
     p = f"d:{d.id}:"
-    mark = lambda ok, t: ("✅ " + t) if ok else t  # noqa: E731
+    pick = lambda ok, t: ("◉ " + t) if ok else ("○ " + t)  # noqa: E731
+    btn = InlineKeyboardButton
     rows = [
+        [btn(text="✏️ Изменить промпт" if d.prompt else "✏️ Написать промпт", callback_data=p + "p")],
+        [btn(text=pick(d.model == m, name), callback_data=p + f"m:{m}") for m, name in (("fast", "SD 2 Fast"), ("sd2", "SD 2"))],
         [
-            InlineKeyboardButton(text=mark(d.model == "fast", "⚡ SD 2 Fast"), callback_data=p + "m:fast"),
-            InlineKeyboardButton(text=mark(d.model == "sd2", "💎 SD 2"), callback_data=p + "m:sd2"),
+            btn(text="−", callback_data=p + "dur:-1"),
+            btn(text=f"{d.duration} сек", callback_data=p + "noop"),
+            btn(text="+", callback_data=p + "dur:+1"),
         ],
-        [
-            InlineKeyboardButton(text="➖", callback_data=p + "dur:-1"),
-            InlineKeyboardButton(text=f"⏱ {d.duration} сек", callback_data=p + "noop"),
-            InlineKeyboardButton(text="➕", callback_data=p + "dur:+1"),
-        ],
-        [
-            InlineKeyboardButton(text=mark(d.duration == v, f"{v}с"), callback_data=p + f"dur:={v}")
-            for v in (4, 5, 8, 10, 15)
-        ],
-        [InlineKeyboardButton(text=mark(d.ratio == r, r), callback_data=p + f"r:{r}") for r in RATIOS],
+        [btn(text=("◉ " if d.duration == v else "") + f"{v}с", callback_data=p + f"dur:={v}") for v in (4, 5, 8, 10, 15)],
+        [btn(text=pick(d.ratio == r, r), callback_data=p + f"r:{r}") for r in RATIOS],
     ]
     if d.refs:
-        rows.append([InlineKeyboardButton(text=f"🗑 Убрать референсы ({len(d.refs)})", callback_data=p + "clr")])
-    rows.append(
-        [
-            InlineKeyboardButton(text="🚀 Сгенерировать", callback_data=p + "go"),
-            InlineKeyboardButton(text="✖️ Отмена", callback_data=p + "x"),
-        ]
-    )
+        rows.append([btn(text=f"🗑 Убрать референсы ({len(d.refs)})", callback_data=p + "clr")])
+    rows.append([btn(text="🚀 Сгенерировать", callback_data=p + "go"), btn(text="✖️ Отмена", callback_data=p + "x")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -434,15 +444,24 @@ async def handle_batch(msgs: list[Message]):
         if is_private(chat.type) and (has_media or raw):
             await first.answer("Сначала выберите модель: /sd2fast или /sd2 (можно сразу с промптом).\n/help — подробнее")
         return
-    if not is_private(chat.type):
-        replied = any(x.reply_to_message and x.reply_to_message.message_id == d.panel_id for x in msgs)
-        if not replied:
-            return
-    d.service_msgs.extend(x.message_id for x in msgs)
+    reply_ids = {x.reply_to_message.message_id for x in msgs if x.reply_to_message}
+    answered_ask = bool(d.ask_id and d.ask_id in reply_ids)
+    if not is_private(chat.type) and not (reply_ids & {d.panel_id, d.ask_id}):
+        return
+    has_media = any(extract_ref(x)[0] for x in msgs)
     warn = add_refs(d, msgs)
     if raw:
         d.prompt = raw.strip()
-    await show_panel(d, resend=True)
+    if d.ask_id and raw and (answered_ask or is_private(chat.type)) and not has_media:
+        # ответ на «напишите промпт»: убираем вопрос и ответ, панель правим на месте
+        await safe(bot.delete_message(d.chat_id, d.ask_id))
+        for x in msgs:
+            await safe(bot.delete_message(d.chat_id, x.message_id))
+        d.ask_id = None
+        await show_panel(d)
+    else:
+        d.service_msgs.extend(x.message_id for x in msgs)
+        await show_panel(d, resend=True)
     if warn:
         await answer_service(d, first, warn)
 
@@ -497,8 +516,14 @@ async def on_panel_button(cb: CallbackQuery):
         d.ratio = arg if arg in RATIOS else d.ratio
     elif action == "clr":
         d.refs.clear()
+    elif action == "p":
+        await ask_prompt(d)
+        await cb.answer()
+        return
     elif action == "x":
         await safe(cb.message.delete())
+        if d.ask_id:
+            await safe(bot.delete_message(d.chat_id, d.ask_id))
         drop_draft(d)
         await cb.answer("Отменено")
         return
@@ -507,6 +532,23 @@ async def on_panel_button(cb: CallbackQuery):
         return
     await safe(cb.message.edit_text(panel_text(d), reply_markup=panel_kb(d)))
     await cb.answer()
+
+
+async def ask_prompt(d: Draft):
+    if d.ask_id:
+        await safe(bot.delete_message(d.chat_id, d.ask_id))
+    cur = f"\n\nСейчас: <code>{html.escape(short(d.prompt, 300))}</code>" if d.prompt else ""
+    text = (
+        "✏️ <b>Напишите промпт</b> ответом на это сообщение.\n"
+        "Опишите сцену: кто в кадре, что происходит, где, какой свет и как движется камера." + cur
+    )
+    markup = None if d.chat_type == ChatType.CHANNEL else ForceReply(
+        input_field_placeholder="Например: кот в скафандре идёт по Луне, кинематографично"
+    )
+    msg = await safe(bot.send_message(d.chat_id, text, reply_markup=markup))
+    if msg:
+        d.ask_id = msg.message_id
+        d.service_msgs.append(msg.message_id)
 
 
 async def may_control(d: Draft, cb: CallbackQuery) -> bool:
@@ -528,7 +570,7 @@ def running_jobs() -> list[Job]:
 
 async def start_job(d: Draft, cb: CallbackQuery):
     if not d.prompt.strip():
-        await cb.answer("Сначала пришлите промпт — текстом в чат.", show_alert=True)
+        await cb.answer("Сначала напишите промпт: кнопка «✏️ Написать промпт».", show_alert=True)
         return
     uid = cb.from_user.id
     if uid not in ADMIN_IDS:
@@ -539,32 +581,132 @@ async def start_job(d: Draft, cb: CallbackQuery):
             await cb.answer("У вас уже есть видео в работе — дождитесь его.", show_alert=True)
             return
     usage[(today(), uid)] = used_today(uid) + 1
+    if d.ask_id:
+        await safe(bot.delete_message(d.chat_id, d.ask_id))
+        d.ask_id = None
     drop_draft(d)
     job = Job(id=uuid.uuid4().hex[:10], draft=d, status_msg_id=d.panel_id, user_id=uid)
     jobs[job.id] = job
     pending.append(job)
     await queue.put(job)
     await cb.answer("Поставил в очередь 🚀")
-    await set_status(job, queued_text(job))
+    await push_status(job)
 
 
-def job_header(d: Draft) -> str:
-    refs = ", ".join(
-        f"{d.count(k)} {n}" for k, n in (("imgs", "фото"), ("vids", "видео"), ("auds", "аудио")) if d.count(k)
-    )
+# ----------------------------------------------------------------- прогресс
+STAGES = [("queue", "Очередь"), ("prep", "Подготовка"), ("gen", "Генерация видео"), ("send", "Отправка в Telegram")]
+# ожидаемое время генерации на сайте: база + сек за каждую секунду ролика; подстраивается по факту
+SPEED = {"fast": (40.0, 6.0), "sd2": (70.0, 12.0)}
+speed_k = {"fast": 1.0, "sd2": 1.0}
+
+
+def expected_gen(d: Draft) -> float:
+    base, per = SPEED[d.model]
+    return (base + per * d.duration) * speed_k[d.model]
+
+
+def learn_speed(d: Draft, took: float):
+    base, per = SPEED[d.model]
+    r = max(0.3, min(5.0, took / (base + per * d.duration)))
+    speed_k[d.model] = 0.7 * speed_k[d.model] + 0.3 * r
+
+
+def fmt_t(sec: float) -> str:
+    sec = max(0, int(sec))
+    return f"{sec // 60}:{sec % 60:02d}"
+
+
+def human_t(sec: float) -> str:
+    sec = int(round(sec / 10) * 10) if sec > 60 else int(sec)
+    m, s_ = divmod(max(0, sec), 60)
+    return (f"{m} мин " if m else "") + (f"{s_} сек" if s_ or not m else "").strip()
+
+
+def bar(frac: float, n: int = 12) -> str:
+    full = max(0, min(n, round(frac * n)))
+    return "▰" * full + "▱" * (n - full)
+
+
+def progress(job: Job) -> float:
+    if job.stage == "queue":
+        return 0.0
+    if job.stage == "prep":
+        return 0.12 * job.prep_frac
+    if job.stage == "gen":
+        x = (time.monotonic() - job.gen_started) / max(1.0, expected_gen(job.draft))
+        f = 0.9 * x if x <= 1 else 0.9 + 0.08 * (1 - math.exp(-2 * (x - 1)))
+        return 0.12 + 0.83 * f
+    return 0.97
+
+
+def params_block(d: Draft) -> str:
     return (
-        f"🎬 <b>{MODELS[d.model]}</b> · {d.duration} сек · {d.ratio}"
-        + (f" · 📎 {refs}" if refs else "")
-        + f"\n📝 {html.escape(short(d.prompt, 300))}\n\n"
+        f"<b>Параметры:</b> {MODELS[d.model]} · {d.duration} сек · {d.ratio} · референсы: {refs_summary(d)}\n"
+        f"<blockquote expandable>{html.escape(short(d.prompt, 700))}</blockquote>"
     )
 
 
-def queued_text(job: Job) -> str:
-    pos = pending.index(job) + 1 if job in pending else 1
-    busy = len(running_jobs())
-    if pos == 1 and busy < MAX_PARALLEL:
-        return job_header(job.draft) + "⏳ Сейчас начну…"
-    return job_header(job.draft) + f"⏳ В очереди: <b>{pos}</b>-й (сейчас в работе: {busy})"
+def render_status(job: Job) -> str:
+    d = job.draft
+    now = time.monotonic()
+    pct = progress(job)
+    order = [k for k, _ in STAGES]
+    cur = order.index(job.stage)
+    lines = []
+    for i, (key, name) in enumerate(STAGES):
+        if i < cur:
+            mark = "✅"
+        elif i == cur:
+            mark = "⏳"
+        else:
+            mark = "▫️"
+        extra = ""
+        if key == "gen" and i == cur:
+            extra = f" · {fmt_t(now - job.gen_started)}"
+        elif key == "gen" and i < cur and job.gen_took:
+            extra = f" · {fmt_t(job.gen_took)}"
+        lines.append(f"{mark} {name}{extra}")
+
+    if job.stage == "queue":
+        pos = pending.index(job) + 1 if job in pending else 1
+        busy = len(running_jobs())
+        info = "Сейчас начну…" if pos == 1 and busy < MAX_PARALLEL else f"Вы {pos}-й в очереди · в работе: {busy}"
+        timing = ""
+    else:
+        info = job.detail
+        elapsed = now - job.started_at
+        if job.stage == "prep":
+            left = expected_gen(d) + 15
+        elif job.stage == "gen":
+            left = expected_gen(d) - (now - job.gen_started) + 10
+        else:
+            left = 10
+        left_s = f"≈ {fmt_t(left)}" if left > 12 else "почти готово"
+        timing = f"\n⏱ Прошло: <b>{fmt_t(elapsed)}</b> · Осталось: <b>{left_s}</b>"
+
+    return (
+        f"🎬 <b>Генерация видео</b> · {MODELS[d.model]}\n\n"
+        f"<code>{bar(pct)}</code> <b>{int(pct * 100)}%</b>\n\n"
+        + "\n".join(lines)
+        + (f"\n\nℹ️ {html.escape(info)}" if info else "")
+        + timing
+        + "\n\n" + params_block(d)
+    )
+
+
+async def push_status(job: Job):
+    job.dirty = False
+    job.last_push = time.monotonic()
+    await set_status(job, render_status(job))
+
+
+async def ticker(job: Job):
+    """Обновляет статус: сразу при смене этапа (не чаще раза в 2 сек) и раз в 5 сек — время и шкалу."""
+    while True:
+        await asyncio.sleep(1)
+        since = time.monotonic() - getattr(job, "last_push", 0)
+        if (job.dirty and since >= 2) or since >= 5:
+            await push_status(job)
 
 
 def status_kb(job: Job) -> InlineKeyboardMarkup:
@@ -592,7 +734,7 @@ async def on_job_button(cb: CallbackQuery):
         job.cancel.set()
         if job in pending:
             pending.remove(job)
-            await set_status(job, job_header(job.draft) + "✖️ Отменено", kb=None)
+            await set_status(job, "✖️ <b>Отменено</b>\n\n" + params_block(job.draft), kb=None)
             usage[(today(), job.user_id)] = max(0, used_today(job.user_id) - 1)
         await cb.answer("Отменяю…")
     elif action == "retry":
@@ -606,7 +748,7 @@ async def on_job_button(cb: CallbackQuery):
         pending.append(new)
         await queue.put(new)
         await cb.answer("Пробую ещё раз")
-        await set_status(new, queued_text(new))
+        await push_status(new)
     elif action == "edit":
         # вернуть задание в черновик, чтобы поменять параметры
         d = job.draft
@@ -640,32 +782,44 @@ async def worker(n: int):
 
 async def refresh_queue_positions():
     for j in list(pending):
-        await set_status(j, queued_text(j))
+        await push_status(j)
 
 
 async def run_job(job: Job):
     d = job.draft
     job.started_at = time.monotonic()
-    head = job_header(d)
+    job.stage, job.detail, job.prep_frac = "prep", "Готовлю задание", 0.0
     tmp = Path(tempfile.mkdtemp(prefix="okr_"))
-    last_edit = [0.0, ""]
+    await push_status(job)
+    tick = asyncio.create_task(ticker(job))
 
-    async def on_status(text: str, force: bool = False):
-        now = time.monotonic()
-        if not force and (now - last_edit[0] < 6 or text == last_edit[1]):
+    async def on_status(stage: str, detail: str = ""):
+        if stage == "generate":
+            if job.stage != "gen":
+                job.stage, job.gen_started = "gen", time.monotonic()
+                job.detail = f"Нейросеть рисует ролик, обычно это занимает около {human_t(expected_gen(d))}"
+                job.dirty = True
             return
-        last_edit[0], last_edit[1] = now, text
-        await set_status(job, head + text)
+        frac, text = {
+            "connect": (0.4, detail or "Подключаюсь к сайту"),
+            "wake": (0.45, f"Сайт генерации просыпается, жду… ({detail})"),
+            "submit": (0.95, detail or "Отправляю задание"),
+        }.get(stage, (job.prep_frac, detail))
+        if stage == "upload":
+            m = re.match(r"(\d+)/(\d+)", detail or "")
+            i, n = (int(m.group(1)), int(m.group(2))) if m else (0, 1)
+            frac, text = 0.5 + 0.4 * i / max(1, n), f"Загружаю референсы на сайт: {i} из {n}"
+        if text != job.detail or frac != job.prep_frac:
+            job.prep_frac, job.detail, job.dirty = frac, text, True
 
     try:
         files: dict[str, list[Path]] = {"imgs": [], "vids": [], "auds": []}
-        if d.refs:
-            await on_status(f"📥 Скачиваю референсы из Telegram (0/{len(d.refs)})…", force=True)
-            for i, r in enumerate(d.refs, 1):
-                safe_name = re.sub(r"[^\w.\-]+", "_", r.name)[-80:] or f"ref{i}"
-                p = tmp / f"{i:02d}_{safe_name}"
-                await bot.download(r.file_id, destination=p)
-                files[r.kind].append(p)
+        for i, r in enumerate(d.refs, 1):
+            job.detail, job.prep_frac, job.dirty = f"Скачиваю референсы из Telegram: {i} из {len(d.refs)}", 0.35 * i / len(d.refs), True
+            safe_name = re.sub(r"[^\w.\-]+", "_", r.name)[-80:] or f"ref{i}"
+            p = tmp / f"{i:02d}_{safe_name}"
+            await bot.download(r.file_id, destination=p)
+            files[r.kind].append(p)
         url = await engine.generate(
             model=d.model,
             prompt=d.prompt,
@@ -675,17 +829,26 @@ async def run_job(job: Job):
             on_status=on_status,
             cancel=job.cancel,
         )
-        await on_status("📦 Видео готово, загружаю в Telegram…", force=True)
+        if job.gen_started:
+            job.gen_took = time.monotonic() - job.gen_started
+            learn_speed(d, job.gen_took)
+        job.stage, job.detail = "send", "Видео готово, загружаю в Telegram"
+        await push_status(job)
+        tick.cancel()
         await deliver(job, url, tmp)
     except Cancelled:
-        await set_status(job, head + "✖️ Отменено", kb=None)
+        tick.cancel()
+        await set_status(job, "✖️ <b>Отменено</b>\n\n" + params_block(d), kb=None)
         usage[(today(), job.user_id)] = max(0, used_today(job.user_id) - 1)
     except GenerationError as e:
+        tick.cancel()
         await fail(job, str(e))
     except Exception as e:  # noqa: BLE001
+        tick.cancel()
         log.exception("job %s", job.id)
         await fail(job, f"внутренняя ошибка: {type(e).__name__}: {e}")
     finally:
+        tick.cancel()
         shutil.rmtree(tmp, ignore_errors=True)
 
 
@@ -698,7 +861,13 @@ async def fail(job: Job, reason: str):
             ]
         ]
     )
-    await set_status(job, job_header(job.draft) + f"❌ Не получилось: {html.escape(short(reason, 500))}", kb=kb)
+    stage = dict(STAGES).get(job.stage, "")
+    await set_status(
+        job,
+        "❌ <b>Не получилось</b>" + (f" на этапе «{stage}»" if stage else "") + "\n\n"
+        f"{html.escape(short(reason, 500))}\n\n" + params_block(job.draft),
+        kb=kb,
+    )
 
 
 async def deliver(job: Job, url: str, tmp: Path):
@@ -752,7 +921,13 @@ async def deliver(job: Job, url: str, tmp: Path):
         for mid in [job.status_msg_id, *d.service_msgs]:
             await safe(bot.delete_message(d.chat_id, mid))
     else:
-        await set_status(job, job_header(d) + f"✅ Готово за {took // 60} мин {took % 60} сек", kb=False)
+        gen = f" · генерация {fmt_t(job.gen_took)}" if job.gen_took else ""
+        await set_status(
+            job,
+            f"✅ <b>Видео готово</b> · {MODELS[d.model]}\n\n<code>{bar(1)}</code> <b>100%</b>\n\n"
+            f"⏱ Всего {fmt_t(took)}{gen}\n\n" + params_block(d),
+            kb=False,
+        )
     jobs.pop(job.id, None)
 
 
@@ -774,7 +949,7 @@ async def on_startup():
         await bot.set_my_short_description(short_description="🎬 Генерация видео SD 2 и SD 2 Fast прямо в Telegram")
         await bot.set_my_description(
             description=f"{BOT_NAME} делает видео по описанию.\n\n"
-            "⚡ /sd2fast — быстрая модель\n💎 /sd2 — больше деталей\n\n"
+            "/sd2fast — быстрая модель\n/sd2 — больше деталей в кадре\n\n"
             "Длительность 4–15 сек, форматы 16:9, 9:16 и 1:1, референсы: фото, видео, аудио. "
             "Можно добавить в группу или канал."
         )
@@ -784,8 +959,8 @@ async def on_startup():
     for i in range(MAX_PARALLEL):
         asyncio.create_task(worker(i))
     cmds = [
-        BotCommand(command="sd2fast", description="⚡ Видео SD 2 Fast"),
-        BotCommand(command="sd2", description="💎 Видео SD 2"),
+        BotCommand(command="sd2fast", description="Видео SD 2 Fast — быстрее"),
+        BotCommand(command="sd2", description="Видео SD 2 — больше деталей"),
         BotCommand(command="queue", description="Очередь"),
         BotCommand(command="cancel", description="Закрыть черновик"),
         BotCommand(command="help", description="Как пользоваться"),

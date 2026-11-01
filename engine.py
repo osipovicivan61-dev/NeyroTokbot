@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import mimetypes
+import re
 import time
 from pathlib import Path
 from typing import Awaitable, Callable
@@ -21,7 +22,8 @@ import httpx
 
 log = logging.getLogger("engine")
 
-StatusCb = Callable[[str], Awaitable[None]]
+# on_status(stage, detail): stage — connect | wake | upload | submit | generate
+StatusCb = Callable[[str, str], Awaitable[None]]
 
 # id инпутов на сайте → (type, role) для референсов
 REF_GROUPS = {
@@ -111,7 +113,7 @@ class BrowserEngine(BaseEngine):
         await self._ensure_browser()
         page = await self._context.new_page()
         try:
-            await on_status("🌐 Открываю сайт…")
+            await on_status("connect", "Открываю сайт")
             # Сайт на Render free может «спать»: пока он просыпается, Render отдаёт
             # страницу-заставку. Ждём до ~5 минут, пока не появится настоящая форма.
             deadline = time.monotonic() + 300
@@ -138,7 +140,7 @@ class BrowserEngine(BaseEngine):
                             f"сайт не открылся за 5 минут (открылось: «{title}» {text!r}). "
                             "Попробуйте позже или включите ENGINE=direct"
                         ) from e
-                    await on_status(f"😴 Сайт просыпается, жду… (попытка {attempt})")
+                    await on_status("wake", f"попытка {attempt}")
                     await asyncio.sleep(10)
 
             # ждём, пока сайт сам получит ключ доступа
@@ -150,7 +152,7 @@ class BrowserEngine(BaseEngine):
             except Exception:  # noqa: BLE001
                 log.warning("ключ не появился за 60 сек — сайт попробует получить его сам при запуске")
 
-            await on_status("✍️ Заполняю форму…")
+            await on_status("submit", "Заполняю форму на сайте")
             # модель (радио-кнопки могут быть скрыты стилями — выставляем через JS)
             ok = await page.evaluate(
                 """(m) => {
@@ -173,7 +175,7 @@ class BrowserEngine(BaseEngine):
             await page.select_option("#ratio", ratio)
 
             await page.click("#go")
-            await on_status("🚀 Запустил генерацию…")
+            await on_status("submit", "Отправляю задание")
 
             deadline = time.monotonic() + GEN_TIMEOUT + 60
             last_timer = ""
@@ -210,7 +212,14 @@ class BrowserEngine(BaseEngine):
                         raise GenerationError("сайт завершил генерацию без результата")
                 if st["timer"] and st["timer"] != last_timer:
                     last_timer = st["timer"]
-                    await on_status("🎬 " + st["timer"])
+                    t = st["timer"]
+                    if t.startswith("Загрузка референса"):
+                        m = re.search(r"(\d+) из (\d+)", t)
+                        await on_status("upload", f"{m.group(1)}/{m.group(2)}" if m else "")
+                    elif t.startswith("Генерация"):
+                        await on_status("generate", "")
+                    else:
+                        await on_status("submit", t.split("·")[0].strip())
                 await asyncio.sleep(2)
             raise GenerationError("время ожидания истекло")
         finally:
@@ -253,7 +262,7 @@ class DirectEngine(BaseEngine):
                 raise Cancelled()
             if time.monotonic() > deadline:
                 raise GenerationError(f"сайт не отвечает 5 минут ({reason}). Попробуйте позже")
-            await on_status(f"😴 Сайт просыпается, жду… (попытка {attempt})")
+            await on_status("wake", f"попытка {attempt}")
             await asyncio.sleep(10)
 
     async def _new_key(self, c: httpx.AsyncClient) -> str:
@@ -266,7 +275,7 @@ class DirectEngine(BaseEngine):
 
     async def generate(self, *, model, prompt, duration, ratio, refs, on_status, cancel) -> str:
         async with self._client() as c:
-            await on_status("🌐 Подключаюсь к сайту…")
+            await on_status("connect", "Подключаюсь к сайту")
             await self._wake(c, on_status, cancel)
             key = self._key or await self._new_key(c)
 
@@ -276,7 +285,7 @@ class DirectEngine(BaseEngine):
             for input_id, (rtype, role) in REF_GROUPS.items():
                 for p in refs.get(input_id, []):
                     n += 1
-                    await on_status(f"📤 Загрузка референса {n} из {total}")
+                    await on_status("upload", f"{n}/{total}")
                     mime = mimetypes.guess_type(p.name)[0] or "application/octet-stream"
                     with open(p, "rb") as fh:
                         r = await c.post("/api/upload", files={"files[]": (p.name, fh, mime)})
@@ -288,7 +297,7 @@ class DirectEngine(BaseEngine):
                         raise GenerationError(f"{p.name}: ссылка на файл не получена")
                     uploaded.append({"url": url, "type": rtype, "role": role})
 
-            await on_status("🎬 Генерация видео")
+            await on_status("generate", "")
             body = {"prompt": prompt, "duration": duration, "ratio": ratio, "model": model, "refs": uploaded}
             r = await c.post("/api/run", json={"key": key, **body}, headers={"X-Api-Key": key})
             if r.status_code == 403:
@@ -328,7 +337,6 @@ class DirectEngine(BaseEngine):
                     return str(httpx.URL(self.site_url + "/").join(sj["url"]))
                 if sj.get("state") == "error":
                     raise GenerationError(sj.get("message") or "ошибка генерации")
-                await on_status(f"🎬 Генерация видео · {int(time.monotonic() - t0)} сек")
             raise GenerationError("время ожидания истекло")
 
 
