@@ -116,6 +116,7 @@ class Draft:
     source_msg_id: int | None = None
     service_msgs: list[int] = field(default_factory=list)  # что удалить в канале после публикации
     ask_id: int | None = None  # сообщение «напишите промпт»
+    ref_ask_id: int | None = None  # сообщение «отправьте референсы»
 
     def count(self, kind: str) -> int:
         return sum(1 for r in self.refs if r.kind == kind)
@@ -337,8 +338,10 @@ def panel_kb(d: Draft) -> InlineKeyboardMarkup:
         [btn(text=("◉ " if d.duration == v else "") + f"{v}с", callback_data=p + f"dur:={v}") for v in (4, 5, 8, 10, 15)],
         [btn(text=pick(d.ratio == r, r), callback_data=p + f"r:{r}") for r in RATIOS],
     ]
+    ref_row = [btn(text="📎 Добавить референс", callback_data=p + "ref")]
     if d.refs:
-        rows.append([btn(text=f"🗑 Убрать референсы ({len(d.refs)})", callback_data=p + "clr")])
+        ref_row.append(btn(text=f"🗑 Убрать ({len(d.refs)})", callback_data=p + "clr"))
+    rows.append(ref_row)
     rows.append([btn(text="🚀 Сгенерировать", callback_data=p + "go"), btn(text="✖️ Отмена", callback_data=p + "x")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -378,8 +381,64 @@ HELP = (
     "🔲 <b>/grid</b> — наложить сетку на фото или видео: размер сетки, цвет (или свой HEX), толщина, "
     "прозрачность, пунктир, диагонали, центр, рамка, подписи клеток, золотое сечение. "
     "Можно ответить <code>/grid</code> на сообщение с фото или видео.\n\n"
-    "/queue — очередь · /cancel — закрыть черновик"
+    "/queue — очередь · /cancel — закрыть панели · /commands — все команды"
 )
+
+
+COMMANDS_TEXT = (
+    "📋 <b>Все команды NeyroTokBot</b>\n\n"
+    "🎬 <b>Генерация видео</b>\n"
+    "/sd2fast <i>[промпт]</i> — SD 2 Fast, быстрее\n"
+    "/sd2 <i>[промпт]</i> — SD 2, больше деталей в кадре\n"
+    "<i>Быстрый ввод:</i> <code>/sd2 10s 9:16 неоновый город</code>\n\n"
+    "🔲 <b>Обработка</b>\n"
+    "/grid — сетка на фото или видео\n\n"
+    "ℹ️ <b>Прочее</b>\n"
+    "/queue — очередь генераций\n"
+    "/cancel — закрыть открытые панели\n"
+    "/commands — этот список\n"
+    "/help — подробная инструкция\n\n"
+    "Или нажмите кнопку ниже 👇"
+)
+
+
+def commands_kb() -> InlineKeyboardMarkup:
+    b = InlineKeyboardButton
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [b(text="🎬 SD 2 Fast", callback_data="menu:sd2fast"), b(text="🎬 SD 2", callback_data="menu:sd2")],
+        [b(text="🔲 Сетка", callback_data="menu:grid")],
+        [b(text="📊 Очередь", callback_data="menu:queue"), b(text="❓ Помощь", callback_data="menu:help")],
+    ])
+
+
+@router.callback_query(F.data.startswith("menu:"))
+async def on_menu_button(cb: CallbackQuery):
+    what = cb.data.split(":", 1)[1]
+    m = cb.message
+    chat = m.chat
+    thread = m.message_thread_id if getattr(m, "is_topic_message", False) else None
+    if chat.type == ChatType.CHANNEL:
+        if not await is_chat_admin(chat.id, cb.from_user.id):
+            await cb.answer("Пользоваться ботом в канале могут только админы.", show_alert=True)
+            return
+        uid, uname = 0, chat.title or "канал"
+    else:
+        uid, uname = cb.from_user.id, cb.from_user.full_name
+    if ALLOWED_CHATS and chat.id not in ALLOWED_CHATS and uid not in ADMIN_IDS:
+        await cb.answer()
+        return
+    if what in ("sd2", "sd2fast"):
+        d = await open_gen(chat.id, chat.type, thread, uid, uname, "fast" if what == "sd2fast" else "sd2")
+        await show_panel(d)
+        await cb.answer()
+    elif what == "grid":
+        await open_grid([], uid, uname, chat_id=chat.id, chat_type=chat.type, thread_id=thread)
+        await cb.answer()
+    elif what == "queue":
+        await cb.answer(re.sub(r"<[^>]+>", "", queue_text()), show_alert=True)
+    elif what == "help":
+        await safe(bot.send_message(chat.id, HELP, message_thread_id=thread))
+        await cb.answer()
 
 
 @router.message()
@@ -407,21 +466,32 @@ async def handle_batch(msgs: list[Message]):
     uid, uname = owner_of(first)
     key = (chat.id, thread_of(first), uid)
 
-    if cmd in ("start", "help"):
+    if cmd == "help":
         await first.answer(HELP)
+        return
+    if cmd in ("start", "commands", "menu"):
+        await first.answer(COMMANDS_TEXT, reply_markup=commands_kb())
         return
     if cmd == "queue":
         await first.answer(queue_text())
         return
     if cmd == "cancel":
+        closed = []
         d = drafts.get(key)
         if d:
-            if d.panel_id:
-                await safe(bot.delete_message(d.chat_id, d.panel_id))
+            for mid in (d.panel_id, d.ask_id, d.ref_ask_id):
+                if mid:
+                    await safe(bot.delete_message(d.chat_id, mid))
             drop_draft(d)
-            await first.answer("Черновик закрыт.")
-        else:
-            await first.answer("Открытого черновика нет.")
+            closed.append("генерации")
+        g = grid_drafts.get(key)
+        if g:
+            for mid in (g.panel_id, g.ask_id, g.media_ask_id):
+                if mid:
+                    await safe(bot.delete_message(g.chat_id, mid))
+            drop_grid(g)
+            closed.append("сетки")
+        await first.answer(f"Закрыл панель {' и '.join(closed)}." if closed else "Открытых панелей нет.")
         return
 
     if cmd == "grid":
@@ -429,29 +499,10 @@ async def handle_batch(msgs: list[Message]):
         return
 
     if cmd in ("sd2", "sd2fast"):
-        active_tool[key] = "gen"
-        old = drafts.get(key)
-        if old:
-            if old.panel_id:
-                await safe(bot.delete_message(old.chat_id, old.panel_id))
-            drop_draft(old)
         prompt, dur, ratio = parse_quick_args(rest)
-        d = Draft(
-            id=uuid.uuid4().hex[:10],
-            chat_id=chat.id,
-            chat_type=chat.type,
-            owner_id=uid,
-            owner_name=uname,
-            model="fast" if cmd == "sd2fast" else "sd2",
-            thread_id=thread_of(first),
-            prompt=prompt,
-            duration=dur or DEFAULT_DURATION,
-            ratio=ratio or DEFAULT_RATIO,
-            source_msg_id=first.message_id,
-        )
+        d = await open_gen(chat.id, chat.type, thread_of(first), uid, uname, "fast" if cmd == "sd2fast" else "sd2",
+                           prompt=prompt, duration=dur, ratio=ratio, source_msg_id=first.message_id)
         d.service_msgs.extend(x.message_id for x in msgs)
-        drafts[key] = d
-        drafts_by_id[d.id] = d
         warn = add_refs(d, msgs)
         await show_panel(d)
         if warn:
@@ -465,8 +516,8 @@ async def handle_batch(msgs: list[Message]):
     g = grid_drafts.get(key)
     if g:
         reply_ids = {x.reply_to_message.message_id for x in msgs if x.reply_to_message}
-        to_grid = bool(reply_ids & {g.panel_id, g.ask_id}) or (
-            active_tool.get(key) == "grid" and not (key in drafts and reply_ids & {drafts[key].panel_id, drafts[key].ask_id})
+        to_grid = bool(reply_ids & {g.panel_id, g.ask_id, g.media_ask_id}) or (
+            active_tool.get(key) == "grid" and not (key in drafts and reply_ids & {drafts[key].panel_id, drafts[key].ask_id, drafts[key].ref_ask_id})
         )
         if to_grid and await grid_incoming(g, msgs, raw):
             return
@@ -481,9 +532,12 @@ async def handle_batch(msgs: list[Message]):
     reply_ids = {x.reply_to_message.message_id for x in msgs if x.reply_to_message}
     answered_ask = bool(d.ask_id and d.ask_id in reply_ids)
     active_tool[key] = "gen"
-    if not is_private(chat.type) and not (reply_ids & {d.panel_id, d.ask_id}):
+    if not is_private(chat.type) and not (reply_ids & {d.panel_id, d.ask_id, d.ref_ask_id}):
         return
     has_media = any(extract_ref(x)[0] for x in msgs)
+    if has_media and d.ref_ask_id:
+        await safe(bot.delete_message(d.chat_id, d.ref_ask_id))
+        d.ref_ask_id = None
     warn = add_refs(d, msgs)
     if raw:
         d.prompt = raw.strip()
@@ -499,6 +553,27 @@ async def handle_batch(msgs: list[Message]):
         await show_panel(d, resend=True)
     if warn:
         await answer_service(d, first, warn)
+
+
+async def open_gen(chat_id: int, chat_type: str, thread_id: int | None, uid: int, uname: str, model: str, *,
+                   prompt: str = "", duration: int | None = None, ratio: str | None = None,
+                   source_msg_id: int | None = None) -> Draft:
+    """Новый черновик генерации (старый в этом чате/теме закрывается). Панель показывает вызывающий."""
+    key = (chat_id, thread_id, uid)
+    active_tool[key] = "gen"
+    old = drafts.get(key)
+    if old:
+        if old.panel_id:
+            await safe(bot.delete_message(old.chat_id, old.panel_id))
+        drop_draft(old)
+    d = Draft(
+        id=uuid.uuid4().hex[:10], chat_id=chat_id, chat_type=chat_type, owner_id=uid, owner_name=uname,
+        model=model, thread_id=thread_id, prompt=prompt, duration=duration or DEFAULT_DURATION,
+        ratio=ratio or DEFAULT_RATIO, source_msg_id=source_msg_id,
+    )
+    drafts[key] = d
+    drafts_by_id[d.id] = d
+    return d
 
 
 def add_refs(d: Draft, msgs: list[Message]) -> str:
@@ -556,6 +631,10 @@ async def on_panel_button(cb: CallbackQuery):
         await ask_prompt(d)
         await cb.answer()
         return
+    elif action == "ref":
+        await ask_refs(d)
+        await cb.answer()
+        return
     elif action == "x":
         await safe(cb.message.delete())
         if d.ask_id:
@@ -584,6 +663,24 @@ async def ask_prompt(d: Draft):
     msg = await safe(bot.send_message(d.chat_id, text, reply_markup=markup, message_thread_id=d.thread_id))
     if msg:
         d.ask_id = msg.message_id
+        d.service_msgs.append(msg.message_id)
+
+
+async def ask_refs(d: Draft):
+    if d.ref_ask_id:
+        await safe(bot.delete_message(d.chat_id, d.ref_ask_id))
+    left = ", ".join(
+        f"{REF_LIMITS[k] - d.count(k)} {n}" for k, n in (("imgs", "фото"), ("vids", "видео"), ("auds", "аудио"))
+    )
+    text = (
+        "📎 <b>Отправьте референсы</b> ответом на это сообщение.\n"
+        "Нажмите на скрепку 📎 и выберите фото, видео или аудио. Можно сразу несколько, альбомом.\n"
+        f"Ещё можно добавить: {left}."
+    )
+    markup = None if d.chat_type == ChatType.CHANNEL else ForceReply(input_field_placeholder="Прикрепите фото, видео или аудио")
+    msg = await safe(bot.send_message(d.chat_id, text, reply_markup=markup, message_thread_id=d.thread_id))
+    if msg:
+        d.ref_ask_id = msg.message_id
         d.service_msgs.append(msg.message_id)
 
 
@@ -814,7 +911,8 @@ class GridDraft:
     cfg: GridCfg = field(default_factory=GridCfg)
     media: Ref | None = None
     panel_id: int | None = None
-    ask_id: int | None = None
+    ask_id: int | None = None  # «пришлите HEX»
+    media_ask_id: int | None = None  # «отправьте фото/видео»
     more: bool = False
     busy: bool = False
     cancel: asyncio.Event = field(default_factory=asyncio.Event)
@@ -873,9 +971,13 @@ def grid_kb(g: GridDraft) -> InlineKeyboardMarkup:
     btn = InlineKeyboardButton
     pick = lambda ok, t: ("◉ " + t) if ok else ("○ " + t)  # noqa: E731
     tick = lambda ok, t: ("☑ " + t) if ok else ("☐ " + t)  # noqa: E731
+    what = "фото" if g.mode == "photo" else "видео"
+    pick_text = (f"🔄 Заменить {what}" if g.media else
+                 ("📷 Выбрать фото" if g.mode == "photo" else "🎬 Выбрать видео"))
     rows = [
         [btn(text=pick(g.mode == "photo", "Фото"), callback_data=p + "mode:photo"),
          btn(text=pick(g.mode == "video", "Видео"), callback_data=p + "mode:video")],
+        [btn(text=pick_text, callback_data=p + "pick")],
         [btn(text="−", callback_data=p + "c:-1"), btn(text=f"Столбцы: {c.cols}", callback_data=p + "noop"),
          btn(text="+", callback_data=p + "c:+1")],
         [btn(text="−", callback_data=p + "r:-1"), btn(text=f"Строки: {c.rows}", callback_data=p + "noop"),
@@ -940,9 +1042,12 @@ def set_grid_media(g: GridDraft, ref: Ref):
     g.mode = "photo" if ref.kind == "imgs" else "video"
 
 
-async def open_grid(msgs: list[Message], uid: int, uname: str):
-    first = msgs[0]
-    key = (first.chat.id, thread_of(first), uid)
+async def open_grid(msgs: list[Message], uid: int, uname: str, *, chat_id: int | None = None,
+                    chat_type: str | None = None, thread_id: int | None = None):
+    first = msgs[0] if msgs else None
+    if first:
+        chat_id, chat_type, thread_id = first.chat.id, first.chat.type, thread_of(first)
+    key = (chat_id, thread_id, uid)
     old = grid_drafts.get(key)
     if old:
         if old.panel_id:
@@ -950,13 +1055,13 @@ async def open_grid(msgs: list[Message], uid: int, uname: str):
         drop_grid(old)
     base = grid_prefs.get(uid)
     g = GridDraft(
-        id=uuid.uuid4().hex[:10], chat_id=first.chat.id, chat_type=first.chat.type, thread_id=thread_of(first),
+        id=uuid.uuid4().hex[:10], chat_id=chat_id, chat_type=chat_type, thread_id=thread_id,
         owner_id=uid, owner_name=uname, cfg=GridCfg(**vars(base)) if base else GridCfg(),
     )
     g.service_msgs.extend(x.message_id for x in msgs)
     # файл в самом сообщении с командой или в сообщении, на которое ответили
     sources = list(msgs)
-    if first.reply_to_message:
+    if first and first.reply_to_message:
         sources.append(first.reply_to_message)
     ref = next((r for r in map(media_ref, sources) if r), None)
     if ref:
@@ -971,11 +1076,14 @@ async def grid_incoming(g: GridDraft, msgs: list[Message], raw: str) -> bool:
     """Обычное сообщение, пока открыта панель сетки. True — сообщение обработано."""
     first = msgs[0]
     reply_ids = {x.reply_to_message.message_id for x in msgs if x.reply_to_message}
-    if not is_private(g.chat_type) and not (reply_ids & {g.panel_id, g.ask_id}):
+    if not is_private(g.chat_type) and not (reply_ids & {g.panel_id, g.ask_id, g.media_ask_id}):
         return False
     ref = next((r for r in map(media_ref, msgs) if r), None)
     if ref:
         set_grid_media(g, ref)
+        if g.media_ask_id:
+            await safe(bot.delete_message(g.chat_id, g.media_ask_id))
+            g.media_ask_id = None
         g.service_msgs.extend(x.message_id for x in msgs)
         await show_grid(g, resend=True)
         return True
@@ -992,6 +1100,8 @@ async def grid_incoming(g: GridDraft, msgs: list[Message], raw: str) -> bool:
             for x in msgs:
                 await safe(bot.delete_message(g.chat_id, x.message_id))
             await show_grid(g)
+        elif g.media_ask_id and g.media_ask_id in reply_ids:
+            await safe(first.answer(f"Нужен файл: нажмите на скрепку 📎 и выберите {'фото' if g.mode == 'photo' else 'видео'}."))
         elif g.ask_id and g.ask_id in reply_ids:
             await safe(first.answer("Не понял цвет. Пришлите HEX, например <code>#FF3B30</code> или <code>0af</code>."))
         else:
@@ -1038,6 +1148,10 @@ async def on_grid_button(cb: CallbackQuery):
         await grid_ask_hex(g)
         await cb.answer()
         return
+    elif action == "pick":
+        await grid_ask_media(g)
+        await cb.answer()
+        return
     elif action == "more":
         g.more = not g.more
     elif action == "th":
@@ -1059,8 +1173,9 @@ async def on_grid_button(cb: CallbackQuery):
         g.media = None
     elif action == "x":
         await safe(cb.message.delete())
-        if g.ask_id:
-            await safe(bot.delete_message(g.chat_id, g.ask_id))
+        for mid in (g.ask_id, g.media_ask_id):
+            if mid:
+                await safe(bot.delete_message(g.chat_id, mid))
         drop_grid(g)
         await cb.answer("Закрыто")
         return
@@ -1073,6 +1188,22 @@ async def on_grid_button(cb: CallbackQuery):
         return
     await safe(cb.message.edit_text(grid_text(g), reply_markup=grid_kb(g)))
     await cb.answer()
+
+
+async def grid_ask_media(g: GridDraft):
+    if g.media_ask_id:
+        await safe(bot.delete_message(g.chat_id, g.media_ask_id))
+    what = "фото" if g.mode == "photo" else "видео"
+    text = (
+        f"{'📷' if g.mode == 'photo' else '🎬'} <b>Отправьте {what}</b> ответом на это сообщение.\n"
+        f"Нажмите на скрепку 📎 и выберите {what} из галереи"
+        + (" (или файлом, если не хотите сжатия)." if g.mode == "photo" else ". До 20 МБ.")
+    )
+    markup = None if g.chat_type == ChatType.CHANNEL else ForceReply(input_field_placeholder=f"Прикрепите {what}")
+    msg = await safe(bot.send_message(g.chat_id, text, reply_markup=markup, message_thread_id=g.thread_id))
+    if msg:
+        g.media_ask_id = msg.message_id
+        g.service_msgs.append(msg.message_id)
 
 
 async def grid_ask_hex(g: GridDraft):
@@ -1390,10 +1521,11 @@ async def setup_menu():
         BotCommand(command="grid", description="🔲 Сетка на фото или видео"),
         BotCommand(command="queue", description="📊 Очередь генераций"),
         BotCommand(command="cancel", description="✖️ Закрыть черновик"),
+        BotCommand(command="commands", description="📋 Все команды"),
         BotCommand(command="help", description="❓ Как пользоваться"),
         BotCommand(command="start", description="🏠 Начало"),
     ]
-    group_cmds = private_cmds[:5]
+    group_cmds = [c for c in private_cmds if c.command != "start"]
     for scope, cmds in (
         (BotCommandScopeDefault(), private_cmds),
         (BotCommandScopeAllPrivateChats(), private_cmds),
