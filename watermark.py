@@ -2,8 +2,8 @@
 Анимированный водяной знак NeyroTok для готовых видео.
 
     ╭──────────────────╮
-    │  ✦ NeyroTok      │   ← Unbounded, металлический серо-белый градиент + бегущий блик,
-    │     PRIVATE      │     искра ✦ мерцает; мелко «PRIVATE» с разрядкой
+    │    NeyroTok      │   ← Unbounded, металлический серо-белый градиент + бегущий блик
+    │     PRIVATE      │   ← мелко, с разрядкой
     │    @username     │   ← кто генерировал
     ╰──────────────────╯   ← полупрозрачная тёмная «таблетка» для читаемости на любом фоне
 
@@ -36,6 +36,7 @@ OPACITY = float(os.getenv("WATERMARK_OPACITY", "0.88"))  # видимость т
 PILL_OPACITY = float(os.getenv("WATERMARK_BG", "0"))  # тёмная подложка: 0 = без неё, например 0.32 — с ней
 POSITION = os.getenv("WATERMARK_POS", "br")  # br | bl | tr | tl | bc
 PRESET = os.getenv("WATERMARK_PRESET", "ultrafast")  # скорость кодирования x264
+STAR = os.getenv("WATERMARK_STAR", "0") == "1"  # искра ✦ перед NeyroTok
 LOOP_SEC = 2.4  # длина цикла блика
 LOOP_FPS = 20  # кадров в секунду у слоя знака (ffmpeg повторит под fps видео)
 
@@ -80,8 +81,8 @@ class Layout:
         self.title, self.small, self.user = "NeyroTok", "PRIVATE", user
         self.t_track = self.f_title.size * 0.01
         self.s_track = self.f_small.size * 0.55
-        self.star_r = self.f_title.size * 0.36
-        self.star_gap = self.f_title.size * 0.30
+        self.star_r = self.f_title.size * 0.36 if STAR else 0.0
+        self.star_gap = self.f_title.size * 0.30 if STAR else 0.0
 
         tb = self.f_title.getbbox(self.title)
         self.t_top, self.t_h = tb[1], tb[3] - tb[1]
@@ -200,6 +201,9 @@ def render_loop(out_dir: Path, w: int, h: int, user: str) -> tuple[Layout, int]:
         lum = Image.composite(Image.new("L", (L.cw, L.ch), 255), metal, shine)  # металл + белый блик
         frame = base.copy()
         frame.alpha_composite(Image.merge("RGBA", (lum, lum, lum, title_a)))
+        if not STAR:
+            frame.save(out_dir / f"wm_{i:04d}.png", compress_level=1)
+            continue
         # искра: мерцание и лёгкий поворот, бесшовно по циклу
         tw = 0.5 - 0.5 * math.cos(ph * 2 * math.pi)
         sc = 0.82 + 0.28 * tw
